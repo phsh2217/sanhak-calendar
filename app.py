@@ -7,21 +7,20 @@ app = Flask(__name__)
 DB_PATH = Path("calendar.db")
 
 
-# ---------- DB & 컬럼 체크 ----------
+# ---------- DB 유틸 ----------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def table_has_admin_column(conn):
-    cols = [row["name"] for row in conn.execute("PRAGMA table_info(events)")]
-    return "admin" in cols
+def get_columns(conn):
+    return [row["name"] for row in conn.execute("PRAGMA table_info(events)")]
 
 
 def init_db():
     conn = get_db()
-    # 기본 테이블 생성 (없으면 새로 생성)
+    # 기본 테이블 생성 (최초 1회)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -36,12 +35,21 @@ def init_db():
         )
         """
     )
-    # admin 컬럼 없으면 추가
-    cols = [row["name"] for row in conn.execute("PRAGMA table_info(events)")]
+    cols = get_columns(conn)
+    # admin 컬럼 추가
     if "admin" not in cols:
         conn.execute("ALTER TABLE events ADD COLUMN admin TEXT")
+    # 기간에서 특정 날짜 숨기기용 excluded_dates 컬럼 (예: '2025-11-27,2025-11-29')
+    if "excluded_dates" not in cols:
+        conn.execute("ALTER TABLE events ADD COLUMN excluded_dates TEXT")
     conn.commit()
     conn.close()
+
+
+# gunicorn으로 실행될 때도 DB 초기화를 하기 위해
+@app.before_first_request
+def _before_first_request():
+    init_db()
 
 
 # ---------- HTML (프론트) ----------
@@ -194,9 +202,9 @@ button { padding: 8px 14px; margin: 0 4px; }
     </div>
     <div class="form-row">
         사업명(선택): 
-        <select id="f_business_select">
-            <option value="">(클릭해서 선택)</option>
-        </select>
+            <select id="f_business_select">
+                <option value="">(선택하지 않고 직접 입력)</option>
+            </select>
     </div>
     <div class="form-row">
         사업명 직접입력: <input type="text" id="f_business" placeholder="새 사업명 입력">
@@ -228,7 +236,8 @@ let events = [];
 let colorMap = {};
 let current = new Date();
 let editingId = null;
-let currentBusinessFilter = "";  // 상단 필터에 선택된 사업명
+let editingDate = null;   // 기간 중 어떤 날짜를 클릭했는지
+let currentBusinessFilter = "";
 
 // 고정 사업명 목록
 const BUSINESS_LIST = ["대관", "지산맞", "일학습", "배터리", "기회발전", "사업주"];
@@ -249,7 +258,6 @@ const BUSINESS_COLOR_MAP = {
     "사업주": "#ffe5f2"
 };
 
-
 // 문자열 날짜 d가 [start, end] 범위 안인지 체크
 function inRange(d, start, end) {
     return (d >= start && d <= end);
@@ -257,7 +265,7 @@ function inRange(d, start, end) {
 
 // 사업명별 색상 할당 (고정 색상 + 그 외는 팔레트)
 function rebuildColorMap() {
-    // 먼저 고정 색상들 세팅
+    // 고정 색상 먼저 세팅
     colorMap = { ...BUSINESS_COLOR_MAP };
 
     // 그 외(새로운 사업명)가 나오면 팔레트에서 순차 배정
@@ -271,12 +279,10 @@ function rebuildColorMap() {
     });
 }
 
-
 // 상단 필터용 사업명 드롭다운 재생성 (고정 목록 사용)
 function rebuildBusinessFilter() {
     const select = document.getElementById("businessFilter");
     if (!select) return;
-
     const prev = currentBusinessFilter;
     select.innerHTML = '<option value="">전체</option>';
     BUSINESS_LIST.forEach(name => {
@@ -292,21 +298,16 @@ function rebuildBusinessFilter() {
 function rebuildBusinessSelect() {
     const sel = document.getElementById("f_business_select");
     if (!sel) return;
-
     const prev = sel.value;
-    sel.innerHTML = '<option value="">(클릭해서 사업명 선택)</option>';
+    sel.innerHTML = '<option value="">(선택하지 않고 직접 입력)</option>';
     BUSINESS_LIST.forEach(name => {
         const opt = document.createElement("option");
         opt.value = name;
         opt.textContent = name;
         sel.appendChild(opt);
     });
-
-    if (BUSINESS_LIST.includes(prev)) {
-        sel.value = prev;
-    } else {
-        sel.value = "";
-    }
+    if (BUSINESS_LIST.includes(prev)) sel.value = prev;
+    else sel.value = "";
 }
 
 // 상단 필터 변경 시
@@ -322,6 +323,18 @@ function resetFilter() {
     const select = document.getElementById("businessFilter");
     if (select) select.value = "";
     buildCalendar();
+}
+
+// excluded_dates 문자열에 날짜 추가
+function addExcludedDate(oldStr, date) {
+    let arr = [];
+    if (oldStr) {
+        arr = oldStr.split(",").map(s => s.trim()).filter(Boolean);
+    }
+    if (!arr.includes(date)) {
+        arr.push(date);
+    }
+    return arr.join(",");
 }
 
 function buildCalendar() {
@@ -354,11 +367,18 @@ function buildCalendar() {
 
             if (!inRange(fd, start, end)) return;
 
+            // excluded_dates에 해당 날짜가 있으면 이 이벤트는 그 날 숨김
+            const exclStr = e.excluded_dates || "";
+            if (exclStr) {
+                const excl = exclStr.split(",").map(s => s.trim()).filter(Boolean);
+                if (excl.includes(fd)) return;
+            }
+
             const bg = colorMap[e.business || ""] || "#eef";
             html += `
                 <div class="event"
                      data-id="${e.id}"
-                     onclick="editEvent(${e.id})"
+                     onclick="editEvent(${e.id}, '${fd}')"
                      style="background-color:${bg};">
                     <span class="title">${e.business || ""}</span>
                     ▪ 과정: ${e.course || ""}<br>
@@ -390,6 +410,7 @@ function nextMonth() {
 
 function openFormNew() {
     editingId = null;
+    editingDate = null;
     document.getElementById("formTitle").innerText = "일정 추가";
     document.getElementById("f_start").value = "";
     document.getElementById("f_end").value = "";
@@ -409,14 +430,14 @@ function findEvent(id) {
     return events.find(e => e.id === id);
 }
 
-function editEvent(id) {
+function editEvent(id, dateStr) {
     const e = findEvent(id);
     if (!e) return;
     editingId = id;
+    editingDate = dateStr || null;   // 기간 중 클릭한 날짜 기억
     document.getElementById("formTitle").innerText = "일정 수정";
     document.getElementById("f_start").value = e.start;
     document.getElementById("f_end").value = e.end || "";
-
     const sel = document.getElementById("f_business_select");
     const input = document.getElementById("f_business");
     if (e.business && sel) {
@@ -431,7 +452,6 @@ function editEvent(id) {
         sel.value = "";
         if (input) input.value = "";
     }
-
     document.getElementById("f_course").value = e.course || "";
     document.getElementById("f_time").value = e.time || "";
     document.getElementById("f_people").value = e.people || "";
@@ -445,6 +465,8 @@ function editEvent(id) {
 function closeForm() {
     document.getElementById("formBox").style.display = "none";
     document.getElementById("formOverlay").style.display = "none";
+    editingId = null;
+    editingDate = null;
 }
 
 async function saveEvent() {
@@ -464,26 +486,72 @@ async function saveEvent() {
     }
     if (!end) end = start;
 
-    const payload = { start, end, business, course, time, people, place, admin };
-
     try {
         if (editingId === null) {
-            // 새 일정 추가
+            // 새 일정 추가 (기간 그대로)
             await fetch("/api/events", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload)
+                body: JSON.stringify({
+                    start, end, business, course, time, people, place, admin,
+                    excluded_dates: ""
+                })
             });
         } else {
-            // 기존 일정 수정
-            await fetch("/api/events/" + editingId, {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload)
-            });
+            const original = findEvent(editingId);
+            if (!original) {
+                alert("대상을 찾을 수 없습니다.");
+                return;
+            }
+
+            // ★ A옵션: 기간 일정 중 특정 하루만 수정
+            // editingDate가 있고, 원래 일정이 기간(start != end)이면:
+            if (editingDate && original.start !== original.end) {
+                const targetDate = editingDate;
+
+                // 1) 원래 기간 이벤트에서 해당 날짜는 제외시키기 (excluded_dates에 추가)
+                const newExcluded = addExcludedDate(original.excluded_dates || "", targetDate);
+                await fetch("/api/events/" + editingId, {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        start: original.start,
+                        end: original.end,
+                        business: original.business,
+                        course: original.course,
+                        time: original.time,
+                        people: original.people,
+                        place: original.place,
+                        admin: original.admin,
+                        excluded_dates: newExcluded
+                    })
+                });
+
+                // 2) 해당 날짜(targetDate)만을 위한 단일 일정 새로 생성 (수정된 값 반영)
+                await fetch("/api/events", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        start: targetDate,
+                        end: targetDate,
+                        business, course, time, people, place, admin,
+                        excluded_dates: ""
+                    })
+                });
+            } else {
+                // 단일 일정이거나, 기간 전체를 고치고 싶은 경우: 통째로 수정
+                await fetch("/api/events/" + editingId, {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        start, end, business, course, time, people, place, admin,
+                        excluded_dates: original.excluded_dates || ""
+                    })
+                });
+            }
         }
-        // ★ 서버에서 전체 일정을 다시 불러와서
-        //    행정 포함 최신 데이터 기준으로 화면 다시 그림
+
+        // 서버에서 최신 데이터 다시 받아와서 반영
         await loadEvents();
         closeForm();
     } catch (err) {
@@ -492,18 +560,13 @@ async function saveEvent() {
     }
 }
 
-
 async function deleteEvent() {
     if (editingId === null) return;
     if (!confirm("이 일정을 삭제하시겠습니까?")) return;
 
     try {
         await fetch("/api/events/" + editingId, { method: "DELETE" });
-        events = events.filter(e => e.id !== editingId);
-        rebuildColorMap();
-        rebuildBusinessFilter();
-        rebuildBusinessSelect();
-        buildCalendar();
+        await loadEvents();
         closeForm();
     } catch (err) {
         console.error(err);
@@ -524,7 +587,8 @@ async function loadEvents() {
             time: e.time || "",
             people: e.people || "",
             place: e.place || "",
-            admin: e.admin || ""   // ★ 반영 누락을 막는 핵심
+            admin: e.admin || "",
+            excluded_dates: e.excluded_dates || ""
         }));
         rebuildColorMap();
         rebuildBusinessFilter();
@@ -535,7 +599,6 @@ async function loadEvents() {
         alert("일정을 불러오는 중 오류가 발생했습니다.");
     }
 }
-
 
 loadEvents();
 </script>
@@ -571,6 +634,7 @@ def create_event():
     people = (data.get("people") or "").strip()
     place = (data.get("place") or "").strip()
     admin = (data.get("admin") or "").strip()
+    excluded = (data.get("excluded_dates") or "").strip()
 
     if not start:
         return jsonify({"error": "start is required"}), 400
@@ -578,25 +642,17 @@ def create_event():
         end = start
 
     conn = get_db()
-    has_admin = table_has_admin_column(conn)
-
-    if has_admin:
-        conn.execute(
-            "INSERT INTO events (start, end, business, course, time, people, place, admin) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (start, end, business, course, time_, people, place, admin),
-        )
-    else:
-        conn.execute(
-            "INSERT INTO events (start, end, business, course, time, people, place) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (start, end, business, course, time_, people, place),
-        )
-
+    cur = conn.execute(
+        """
+        INSERT INTO events
+            (start, end, business, course, time, people, place, admin, excluded_dates)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (start, end, business, course, time_, people, place, admin, excluded),
+    )
     conn.commit()
-    row = conn.execute(
-        "SELECT * FROM events WHERE id = (SELECT MAX(id) FROM events)"
-    ).fetchone()
+    event_id = cur.lastrowid
+    row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
     conn.close()
     return jsonify(dict(row)), 201
 
@@ -612,6 +668,7 @@ def update_event(event_id):
     people = (data.get("people") or "").strip()
     place = (data.get("place") or "").strip()
     admin = (data.get("admin") or "").strip()
+    excluded = (data.get("excluded_dates") or "").strip()
 
     if not start:
         return jsonify({"error": "start is required"}), 400
@@ -619,27 +676,14 @@ def update_event(event_id):
         end = start
 
     conn = get_db()
-    has_admin = table_has_admin_column(conn)
-
-    if has_admin:
-        conn.execute(
-            """
-            UPDATE events
-               SET start=?, end=?, business=?, course=?, time=?, people=?, place=?, admin=?
-             WHERE id=?
-            """,
-            (start, end, business, course, time_, people, place, admin, event_id),
-        )
-    else:
-        conn.execute(
-            """
-            UPDATE events
-               SET start=?, end=?, business=?, course=?, time=?, people=?, place=?
-             WHERE id=?
-            """,
-            (start, end, business, course, time_, people, place, event_id),
-        )
-
+    conn.execute(
+        """
+        UPDATE events
+           SET start=?, end=?, business=?, course=?, time=?, people=?, place=?, admin=?, excluded_dates=?
+         WHERE id=?
+        """,
+        (start, end, business, course, time_, people, place, admin, excluded, event_id),
+    )
     conn.commit()
     row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
     conn.close()
@@ -661,8 +705,3 @@ if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-
-
-
-
-
