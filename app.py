@@ -120,7 +120,12 @@ th:nth-child(7), td:nth-child(7) { color: blue; }
     padding: 3px;
     border-radius: 4px;
     cursor: pointer;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    white-space: normal;
+    max-width: 100%;
 }
+
 .event .title {
     display: block;
     font-weight: bold;
@@ -535,3 +540,4 @@ def delete_event(event_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
