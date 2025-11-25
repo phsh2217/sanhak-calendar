@@ -294,7 +294,7 @@ function rebuildBusinessSelect() {
     if (!sel) return;
 
     const prev = sel.value;
-    sel.innerHTML = '<option value="">(선택하지 않고 직접 입력)</option>';
+    sel.innerHTML = '<option value="">(클릭해서 사업명 선택)</option>';
     BUSINESS_LIST.forEach(name => {
         const opt = document.createElement("option");
         opt.value = name;
@@ -663,5 +663,6 @@ if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
 
 
