@@ -41,8 +41,10 @@ INDEX_HTML = """
 <meta charset="UTF-8">
 <title>포항산학 월별일정</title>
 <style>
+
 body { font-family: Arial, sans-serif; }
-#calendar { width: 1000px; margin: 20px auto; }
+#calendar { width: 100%; max-width: 1000px; margin: 20px auto; }
+
 table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 th, td {
     border: 1px solid #ccc;
@@ -103,6 +105,44 @@ button { padding: 8px 14px; margin: 0 4px; }
 .form-row input, .form-row select { width: 100%; box-sizing: border-box; }
 .form-actions { text-align: right; margin-top: 10px; }
 .form-actions button { margin-left: 4px; }
+
+/* 모바일 화면 대응 */
+@media (max-width: 768px) {
+    #calendar {
+        width: 100%;
+        margin: 0;
+        max-width: 1000px;
+    }
+    table {
+        font-size: 11px;
+    }
+    th, td {
+        height: 70px;
+        padding: 2px;
+    }
+    .event {
+        margin-top: 2px;
+        padding: 2px;
+        font-size: 10px;
+    }
+    .nav, #top-controls {
+        width: 100%;
+        text-align: center;
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 4px;
+    }
+    #title {
+        width: 100%;
+        display: block;
+        margin-bottom: 6px;
+    }
+}
+
+
+
+
 </style>
 </head>
 <body>
