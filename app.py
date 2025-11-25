@@ -468,33 +468,30 @@ async function saveEvent() {
 
     try {
         if (editingId === null) {
-            const res = await fetch("/api/events", {
+            // 새 일정 추가
+            await fetch("/api/events", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(payload)
             });
-            const created = await res.json();
-            events.push(created);
         } else {
-            const res = await fetch("/api/events/" + editingId, {
+            // 기존 일정 수정
+            await fetch("/api/events/" + editingId, {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(payload)
             });
-            const updated = await res.json();
-            const idx = events.findIndex(e => e.id === editingId);
-            if (idx !== -1) events[idx] = updated;
         }
-        rebuildColorMap();
-        rebuildBusinessFilter();
-        rebuildBusinessSelect();
-        buildCalendar();
+        // ★ 서버에서 전체 일정을 다시 불러와서
+        //    행정 포함 최신 데이터 기준으로 화면 다시 그림
+        await loadEvents();
         closeForm();
     } catch (err) {
         console.error(err);
         alert("저장 중 오류가 발생했습니다.");
     }
 }
+
 
 async function deleteEvent() {
     if (editingId === null) return;
@@ -663,6 +660,7 @@ if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
