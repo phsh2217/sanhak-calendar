@@ -4,7 +4,7 @@ from pathlib import Path
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-DB_PATH = Path("calendar.db")
+DB_PATH = Path("/data/calendar.db")
 
 
 # ---------- DB 초기화 (데이터는 건드리지 않고, 컬럼만 맞춰줌) ----------
@@ -555,6 +555,7 @@ def delete_event(event_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
