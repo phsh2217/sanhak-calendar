@@ -7,16 +7,21 @@ app = Flask(__name__)
 DB_PATH = Path("calendar.db")
 
 
-# ---------- DB 초기화 ----------
+# ---------- DB & 컬럼 체크 ----------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+def table_has_admin_column(conn):
+    cols = [row["name"] for row in conn.execute("PRAGMA table_info(events)")]
+    return "admin" in cols
+
+
 def init_db():
     conn = get_db()
-    # 기본 테이블 생성 (없을 때만)
+    # 기본 테이블 생성 (없으면 새로 생성)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -27,12 +32,11 @@ def init_db():
             course   TEXT,
             time     TEXT,
             people   TEXT,
-            place    TEXT,
-            admin    TEXT
+            place    TEXT
         )
         """
     )
-    # 기존 DB에 admin 컬럼이 없으면 자동으로 추가
+    # admin 컬럼 없으면 추가
     cols = [row["name"] for row in conn.execute("PRAGMA table_info(events)")]
     if "admin" not in cols:
         conn.execute("ALTER TABLE events ADD COLUMN admin TEXT")
@@ -561,13 +565,25 @@ def create_event():
         end = start
 
     conn = get_db()
-    cur = conn.execute(
-        "INSERT INTO events (start, end, business, course, time, people, place, admin) VALUES (?,?,?,?,?,?,?,?)",
-        (start, end, business, course, time_, people, place, admin),
-    )
+    has_admin = table_has_admin_column(conn)
+
+    if has_admin:
+        conn.execute(
+            "INSERT INTO events (start, end, business, course, time, people, place, admin) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (start, end, business, course, time_, people, place, admin),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO events (start, end, business, course, time, people, place) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (start, end, business, course, time_, people, place),
+        )
+
     conn.commit()
-    event_id = cur.lastrowid
-    row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+    row = conn.execute(
+        "SELECT * FROM events WHERE id = (SELECT MAX(id) FROM events)"
+    ).fetchone()
     conn.close()
     return jsonify(dict(row)), 201
 
@@ -590,14 +606,27 @@ def update_event(event_id):
         end = start
 
     conn = get_db()
-    conn.execute(
-        """
-        UPDATE events
-           SET start=?, end=?, business=?, course=?, time=?, people=?, place=?, admin=?
-         WHERE id=?
-        """,
-        (start, end, business, course, time_, people, place, admin, event_id),
-    )
+    has_admin = table_has_admin_column(conn)
+
+    if has_admin:
+        conn.execute(
+            """
+            UPDATE events
+               SET start=?, end=?, business=?, course=?, time=?, people=?, place=?, admin=?
+             WHERE id=?
+            """,
+            (start, end, business, course, time_, people, place, admin, event_id),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE events
+               SET start=?, end=?, business=?, course=?, time=?, people=?, place=?
+             WHERE id=?
+            """,
+            (start, end, business, course, time_, people, place, event_id),
+        )
+
     conn.commit()
     row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
     conn.close()
