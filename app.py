@@ -524,7 +524,7 @@ async function loadEvents() {
             time: e.time || "",
             people: e.people || "",
             place: e.place || "",
-            admin: e.admin || ""
+            admin: e.admin || ""   // ★ 반영 누락을 막는 핵심
         }));
         rebuildColorMap();
         rebuildBusinessFilter();
@@ -535,6 +535,7 @@ async function loadEvents() {
         alert("일정을 불러오는 중 오류가 발생했습니다.");
     }
 }
+
 
 loadEvents();
 </script>
@@ -660,6 +661,7 @@ if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
