@@ -7,10 +7,14 @@ app = Flask(__name__)
 DB_PATH = Path("calendar.db")
 
 
-# ---------- DB 초기화 (데이터 삭제 안 함) ----------
+# ---------- DB 초기화 (데이터는 건드리지 않고, 컬럼만 맞춰줌) ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    # 1) 테이블이 없으면 새 구조로 생성
+    cur.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -27,10 +31,21 @@ def init_db():
         """
     )
     conn.commit()
+
+    # 2) 이미 있는 테이블이면 컬럼 목록 확인해서 부족한 컬럼만 추가
+    cur.execute("PRAGMA table_info(events)")
+    cols = [row["name"] for row in cur.fetchall()]
+
+    if "admin" not in cols:
+        cur.execute("ALTER TABLE events ADD COLUMN admin TEXT")
+    if "excluded_dates" not in cols:
+        cur.execute("ALTER TABLE events ADD COLUMN excluded_dates TEXT")
+
+    conn.commit()
     conn.close()
 
 
-# 서버 시작 시, 테이블이 없으면 만들기만 함 (기존 데이터는 그대로 유지)
+# 서버 시작 시, 테이블/컬럼만 맞춰주기 (데이터는 유지)
 init_db()
 
 
@@ -39,6 +54,7 @@ def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 
 
@@ -539,5 +555,6 @@ def delete_event(event_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
 
 
