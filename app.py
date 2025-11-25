@@ -7,10 +7,8 @@ app = Flask(__name__)
 DB_PATH = Path("calendar.db")
 
 
-# ---------- DB 초기화 ----------
-def reset_db():
-    if DB_PATH.exists():
-        DB_PATH.unlink()  # 기존 DB 삭제
+# ---------- DB 초기화 (데이터 삭제 안 함) ----------
+def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
@@ -32,8 +30,8 @@ def reset_db():
     conn.close()
 
 
-# 서버 시작 시 DB 초기화 실행
-reset_db()
+# 서버 시작 시, 테이블이 없으면 만들기만 함 (기존 데이터는 그대로 유지)
+init_db()
 
 
 # ---------- DB 유틸 ----------
@@ -41,6 +39,7 @@ def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 
 # ---------- HTML ----------
@@ -540,4 +539,5 @@ def delete_event(event_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
 
