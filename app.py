@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from pathlib import Path
 from flask import Flask, request, jsonify
@@ -15,20 +16,26 @@ def get_db():
 
 def init_db():
     conn = get_db()
+    # 기본 테이블 생성 (없을 때만)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
-            id      INTEGER PRIMARY KEY AUTOINCREMENT,
-            start   TEXT NOT NULL,
-            end     TEXT NOT NULL,
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            start    TEXT NOT NULL,
+            end      TEXT NOT NULL,
             business TEXT,
             course   TEXT,
             time     TEXT,
             people   TEXT,
-            place    TEXT
+            place    TEXT,
+            admin    TEXT
         )
         """
     )
+    # 기존 DB에 admin 컬럼이 없으면 자동으로 추가
+    cols = [row["name"] for row in conn.execute("PRAGMA table_info(events)")]
+    if "admin" not in cols:
+        conn.execute("ALTER TABLE events ADD COLUMN admin TEXT")
     conn.commit()
     conn.close()
 
@@ -40,11 +47,10 @@ INDEX_HTML = """
 <head>
 <meta charset="UTF-8">
 <title>포항산학 월별일정</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
-
 body { font-family: Arial, sans-serif; }
 #calendar { width: 100%; max-width: 1000px; margin: 20px auto; }
-
 table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 th, td {
     border: 1px solid #ccc;
@@ -71,11 +77,12 @@ th { background: #f3f3f3; }
     text-align: center;  /* 사업명 가운데 정렬 */
 }
 
-.nav { width: 1000px; margin: 10px auto; text-align: right; }
+.nav { width: 100%; max-width: 1000px; margin: 10px auto; text-align: right; }
 button { padding: 8px 14px; margin: 0 4px; }
 
 #top-controls {
-    width: 1000px;
+    width: 100%;
+    max-width: 1000px;
     margin: 0 auto 10px auto;
     text-align: right;
 }
@@ -110,7 +117,7 @@ button { padding: 8px 14px; margin: 0 4px; }
 @media (max-width: 768px) {
     #calendar {
         width: 100%;
-        margin: 0;
+        margin: 10px auto;
         max-width: 1000px;
     }
     table {
@@ -127,6 +134,7 @@ button { padding: 8px 14px; margin: 0 4px; }
     }
     .nav, #top-controls {
         width: 100%;
+        max-width: 1000px;
         text-align: center;
         display: flex;
         flex-wrap: wrap;
@@ -137,12 +145,9 @@ button { padding: 8px 14px; margin: 0 4px; }
         width: 100%;
         display: block;
         margin-bottom: 6px;
+        text-align: center;
     }
 }
-
-
-
-
 </style>
 </head>
 <body>
@@ -152,14 +157,14 @@ button { padding: 8px 14px; margin: 0 4px; }
     포항산학 월별일정
 </h1>
 
-<!-- 월 이동 버튼 + 월 타이틀 (오른쪽 정렬) -->
+<!-- 월 이동 버튼 + 월 타이틀 -->
 <div class="nav">
     <button onclick="prevMonth()">◀ 이전달</button>
     <span id="title" style="font-weight:bold; font-size:16px; margin:0 8px;"></span>
     <button onclick="nextMonth()">다음달 ▶</button>
 </div>
 
-<!-- 사업명 필터 + 초기화 + 일정추가 (오른쪽 정렬) -->
+<!-- 사업명 필터 + 초기화 + 일정추가 -->
 <div id="top-controls">
     <label style="margin-right:8px;">
         사업명:
@@ -203,6 +208,9 @@ button { padding: 8px 14px; margin: 0 4px; }
     </div>
     <div class="form-row">
         훈련장소: <input type="text" id="f_place">
+    </div>
+    <div class="form-row">
+        행정: <input type="text" id="f_admin" placeholder="행정 관련 메모">
     </div>
     <div class="form-actions">
         <button onclick="closeForm()">취소</button>
@@ -337,7 +345,8 @@ function buildCalendar() {
                     ▪ 과정: ${e.course || ""}<br>
                     ▪ 시간: ${e.time || ""}<br>
                     ▪ 인원: ${e.people || ""}<br>
-                    ▪ 장소: ${e.place || ""}
+                    ▪ 장소: ${e.place || ""}<br>
+                    ▪ 행정: ${e.admin || ""}
                 </div>`;
         });
 
@@ -371,6 +380,7 @@ function openFormNew() {
     document.getElementById("f_time").value = "";
     document.getElementById("f_people").value = "";
     document.getElementById("f_place").value = "";
+    document.getElementById("f_admin").value = "";
     document.getElementById("deleteBtn").style.display = "none";
     document.getElementById("formBox").style.display = "block";
     document.getElementById("formOverlay").style.display = "block";
@@ -407,6 +417,7 @@ function editEvent(id) {
     document.getElementById("f_time").value = e.time || "";
     document.getElementById("f_people").value = e.people || "";
     document.getElementById("f_place").value = e.place || "";
+    document.getElementById("f_admin").value = e.admin || "";
     document.getElementById("deleteBtn").style.display = "inline-block";
     document.getElementById("formBox").style.display = "block";
     document.getElementById("formOverlay").style.display = "block";
@@ -426,6 +437,7 @@ async function saveEvent() {
     const time = document.getElementById("f_time").value;
     const people = document.getElementById("f_people").value;
     const place = document.getElementById("f_place").value;
+    const admin = document.getElementById("f_admin").value;
 
     if (!start) {
         alert("시작일을 입력해주세요.");
@@ -433,7 +445,7 @@ async function saveEvent() {
     }
     if (!end) end = start;
 
-    const payload = { start, end, business, course, time, people, place };
+    const payload = { start, end, business, course, time, people, place, admin };
 
     try {
         if (editingId === null) {
@@ -495,7 +507,8 @@ async function loadEvents() {
             course: e.course || "",
             time: e.time || "",
             people: e.people || "",
-            place: e.place || ""
+            place: e.place || "",
+            admin: e.admin || ""
         }));
         rebuildColorMap();
         rebuildBusinessFilter();
@@ -540,6 +553,7 @@ def create_event():
     time_ = (data.get("time") or "").strip()
     people = (data.get("people") or "").strip()
     place = (data.get("place") or "").strip()
+    admin = (data.get("admin") or "").strip()
 
     if not start:
         return jsonify({"error": "start is required"}), 400
@@ -548,8 +562,8 @@ def create_event():
 
     conn = get_db()
     cur = conn.execute(
-        "INSERT INTO events (start, end, business, course, time, people, place) VALUES (?,?,?,?,?,?,?)",
-        (start, end, business, course, time_, people, place),
+        "INSERT INTO events (start, end, business, course, time, people, place, admin) VALUES (?,?,?,?,?,?,?,?)",
+        (start, end, business, course, time_, people, place, admin),
     )
     conn.commit()
     event_id = cur.lastrowid
@@ -568,6 +582,7 @@ def update_event(event_id):
     time_ = (data.get("time") or "").strip()
     people = (data.get("people") or "").strip()
     place = (data.get("place") or "").strip()
+    admin = (data.get("admin") or "").strip()
 
     if not start:
         return jsonify({"error": "start is required"}), 400
@@ -578,10 +593,10 @@ def update_event(event_id):
     conn.execute(
         """
         UPDATE events
-           SET start=?, end=?, business=?, course=?, time=?, people=?, place=?
+           SET start=?, end=?, business=?, course=?, time=?, people=?, place=?, admin=?
          WHERE id=?
         """,
-        (start, end, business, course, time_, people, place, event_id),
+        (start, end, business, course, time_, people, place, admin, event_id),
     )
     conn.commit()
     row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
@@ -599,7 +614,8 @@ def delete_event_api(event_id):
     conn.close()
     return "", 204
 
+
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=5000, debug=True)
-
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
