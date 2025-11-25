@@ -7,6 +7,35 @@ app = Flask(__name__)
 DB_PATH = Path("calendar.db")
 
 
+# ---------- DB 초기화 ----------
+def reset_db():
+    if DB_PATH.exists():
+        DB_PATH.unlink()  # 기존 DB 삭제
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            start TEXT NOT NULL,
+            end TEXT NOT NULL,
+            business TEXT,
+            course TEXT,
+            time TEXT,
+            people TEXT,
+            place TEXT,
+            admin TEXT,
+            excluded_dates TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+# 서버 시작 시 DB 초기화 실행
+reset_db()
+
+
 # ---------- DB 유틸 ----------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -14,45 +43,7 @@ def get_db():
     return conn
 
 
-def get_columns(conn):
-    return [row["name"] for row in conn.execute("PRAGMA table_info(events)")]
-
-
-def init_db():
-    conn = get_db()
-    # 기본 테이블 생성 (최초 1회)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS events (
-            id       INTEGER PRIMARY KEY AUTOINCREMENT,
-            start    TEXT NOT NULL,
-            end      TEXT NOT NULL,
-            business TEXT,
-            course   TEXT,
-            time     TEXT,
-            people   TEXT,
-            place    TEXT
-        )
-        """
-    )
-    cols = get_columns(conn)
-    # admin 컬럼 추가
-    if "admin" not in cols:
-        conn.execute("ALTER TABLE events ADD COLUMN admin TEXT")
-    # 기간에서 특정 날짜 숨기기용 excluded_dates 컬럼 (예: '2025-11-27,2025-11-29')
-    if "excluded_dates" not in cols:
-        conn.execute("ALTER TABLE events ADD COLUMN excluded_dates TEXT")
-    conn.commit()
-    conn.close()
-
-
-# gunicorn으로 실행될 때도 DB 초기화를 하기 위해
-@app.before_first_request
-def _before_first_request():
-    init_db()
-
-
-# ---------- HTML (프론트) ----------
+# ---------- HTML ----------
 INDEX_HTML = """
 <!DOCTYPE html>
 <html lang="ko">
@@ -60,9 +51,57 @@ INDEX_HTML = """
 <meta charset="UTF-8">
 <title>포항산학 월별일정</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
 <style>
-body { font-family: Arial, sans-serif; }
-#calendar { width: 100%; max-width: 1000px; margin: 20px auto; }
+body { font-family: Arial, sans-serif; margin: 0; padding: 0; }
+h1 { text-align:center; margin-top:20px; margin-bottom:10px; }
+
+/* 월 제목 */
+.month-title {
+    text-align: center;
+    font-size: 22px;
+    font-weight: bold;
+    margin-top: 0;
+    margin-bottom: 5px;
+}
+
+/* 버튼 컨트롤 */
+#month-controls {
+    width: 100%;
+    max-width: 1000px;
+    margin: 5px auto 10px auto;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+#month-controls-left button {
+    padding: 8px 12px;
+    margin-right: 5px;
+    cursor: pointer;
+}
+#month-controls-right button {
+    padding: 8px 12px;
+    cursor: pointer;
+}
+
+#top-controls {
+    width: 100%;
+    max-width: 1000px;
+    margin: 0 auto 10px auto;
+    display:flex;
+    justify-content: flex-start;
+    align-items:center;
+    gap: 10px;
+}
+button { cursor:pointer; }
+
+#calendar {
+    width: 100%;
+    max-width: 1000px;
+    margin: 10px auto;
+}
+
+/* 달력 테이블 */
 table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 th, td {
     border: 1px solid #ccc;
@@ -70,11 +109,10 @@ th, td {
     vertical-align: top;
     height: 95px;
     font-size: 12px;
-    word-wrap: break-word;
 }
-th:nth-child(1), td:nth-child(1) { color: red; }   /* 일요일 */
-th:nth-child(7), td:nth-child(7) { color: blue; }  /* 토요일 */
-th { background: #f3f3f3; }
+th { background:#f3f3f3; }
+th:nth-child(1), td:nth-child(1) { color: red; }
+th:nth-child(7), td:nth-child(7) { color: blue; }
 
 .event {
     font-size: 11px;
@@ -86,144 +124,81 @@ th { background: #f3f3f3; }
 .event .title {
     display: block;
     font-weight: bold;
-    text-align: center;  /* 사업명 가운데 정렬 */
+    text-align: center;
 }
 
-.nav { width: 100%; max-width: 1000px; margin: 10px auto; text-align: right; }
-button { padding: 8px 14px; margin: 0 4px; }
-
-#top-controls {
-    width: 100%;
-    max-width: 1000px;
-    margin: 0 auto 10px auto;
-    text-align: right;
-}
-
-#formBox {
-    position: fixed;
-    top: 50%; left: 50%;
-    transform: translate(-50%, -50%);
-    background: white;
-    border: 1px solid #aaa;
-    padding: 16px 20px;
-    display: none;
-    z-index: 1000;
-    width: 360px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-}
+/* 팝업 */
 #formOverlay {
-    position: fixed;
-    top: 0; left: 0;
-    width: 100%; height: 100%;
+    position: fixed; top:0; left:0; width:100%; height:100%;
     background: rgba(0,0,0,0.3);
-    display: none;
-    z-index: 900;
+    display:none;
 }
-#formBox h3 { margin-top: 0; }
-.form-row { margin-bottom: 8px; font-size: 13px; }
-.form-row input, .form-row select { width: 100%; box-sizing: border-box; }
-.form-actions { text-align: right; margin-top: 10px; }
-.form-actions button { margin-left: 4px; }
+#formBox {
+    position: fixed; top:50%; left:50%;
+    transform: translate(-50%, -50%);
+    background: #fff; padding: 20px;
+    width: 350px; border:1px solid #777;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    display:none;
+}
+.form-row { margin-bottom: 8px; font-size:14px; }
+.form-row input, .form-row select { width:100%; padding:4px; }
+.form-actions { text-align:right; margin-top:10px; }
+.form-actions button { margin-left:4px; }
 
-/* 모바일 화면 대응 */
+/* 모바일 */
 @media (max-width: 768px) {
-    #calendar {
-        width: 100%;
-        margin: 10px auto;
-        max-width: 1000px;
-    }
-    table {
-        font-size: 11px;
-    }
-    th, td {
-        height: 70px;
-        padding: 2px;
-    }
-    .event {
-        margin-top: 2px;
-        padding: 2px;
-        font-size: 10px;
-    }
-    .nav, #top-controls {
-        width: 100%;
-        max-width: 1000px;
-        text-align: center;
-        display: flex;
-        flex-wrap: wrap;
-        justify-content: center;
-        gap: 4px;
-    }
-    #title {
-        width: 100%;
-        display: block;
-        margin-bottom: 6px;
-        text-align: center;
-    }
+    th, td { height: 70px; font-size: 11px; }
 }
 </style>
 </head>
 <body>
 
-<!-- 상단 타이틀(가운데) -->
-<h1 style="text-align:center; margin-top:20px; margin-bottom:10px;">
-    포항산학 월별일정
-</h1>
+<h1>포항산학 월별일정</h1>
 
-<!-- 월 이동 버튼 + 월 타이틀 -->
-<div class="nav">
-    <button onclick="prevMonth()">◀ 이전달</button>
-    <span id="title" style="font-weight:bold; font-size:16px; margin:0 8px;"></span>
-    <button onclick="nextMonth()">다음달 ▶</button>
+<!-- 월 제목 -->
+<div class="month-title" id="title"></div>
+
+<!-- 이전달/다음달 + 일정추가 -->
+<div id="month-controls">
+    <div id="month-controls-left">
+        <button onclick="prevMonth()">◀ 이전달</button>
+        <button onclick="nextMonth()">다음달 ▶</button>
+    </div>
+    <div id="month-controls-right">
+        <button onclick="openFormNew()">+ 일정 추가하기</button>
+    </div>
 </div>
 
-<!-- 사업명 필터 + 초기화 + 일정추가 -->
+<!-- 필터 -->
 <div id="top-controls">
-    <label style="margin-right:8px;">
-        사업명:
+    <label>사업명:
         <select id="businessFilter" onchange="onBusinessFilterChange()">
             <option value="">전체</option>
         </select>
     </label>
     <button onclick="resetFilter()">필터 초기화</button>
-    <button onclick="openFormNew()">+ 일정 추가하기</button>
 </div>
 
 <div id="calendar"></div>
-
 <div id="formOverlay" onclick="closeForm()"></div>
 
+<!-- 일정 입력창 -->
 <div id="formBox">
     <h3 id="formTitle">일정 추가</h3>
-    <div class="form-row">
-        시작일: <input type="date" id="f_start">
+
+    <div class="form-row">시작일: <input type="date" id="f_start"></div>
+    <div class="form-row">종료일: <input type="date" id="f_end"></div>
+    <div class="form-row">사업명:
+        <select id="f_business_select"></select>
+        <input type="text" id="f_business" placeholder="직접입력">
     </div>
-    <div class="form-row">
-        종료일(선택): <input type="date" id="f_end">
-    </div>
-    <div class="form-row">
-        사업명(선택): 
-            <select id="f_business_select">
-                <option value="">(선택하지 않고 직접 입력)</option>
-            </select>
-    </div>
-    <div class="form-row">
-        사업명 직접입력: <input type="text" id="f_business" placeholder="새 사업명 입력">
-    </div>
-    <div class="form-row">
-        과정명: <input type="text" id="f_course">
-    </div>
-    <div class="form-row">
-        훈련(대관) 시간: <input type="text" id="f_time" placeholder="예: 0900~1800">
-    </div>
-    <div class="form-row">
-        대상 인원: <input type="text" id="f_people">
-    </div>
-    <div class="form-row">
-        훈련장소: <input type="text" id="f_place">
-    </div>
-    <div class="form-row">
-        행정: <input type="text" id="f_admin" placeholder="행정 관련 메모">
-    </div>
+    <div class="form-row">과정명: <input type="text" id="f_course"></div>
+    <div class="form-row">훈련(대관) 시간: <input type="text" id="f_time"></div>
+    <div class="form-row">대상 인원: <input type="text" id="f_people"></div>
+    <div class="form-row">훈련장소: <input type="text" id="f_place"></div>
+    <div class="form-row">행정: <input type="text" id="f_admin"></div>
+
     <div class="form-actions">
         <button onclick="closeForm()">취소</button>
         <button id="deleteBtn" onclick="deleteEvent()" style="display:none;">삭제</button>
@@ -236,53 +211,32 @@ let events = [];
 let colorMap = {};
 let current = new Date();
 let editingId = null;
-let editingDate = null;   // 기간 중 어떤 날짜를 클릭했는지
+let editingDate = null;
 let currentBusinessFilter = "";
 
-// 고정 사업명 목록
-const BUSINESS_LIST = ["대관", "지산맞", "일학습", "배터리", "기회발전", "사업주"];
-
-// 사업명별 색상 팔레트
-const palette = [
-    "#ffe5e5", "#e5f7ff", "#e9ffe5", "#fff4e5",
-    "#f0e5ff", "#ffe5f2", "#e5fff7", "#f5e5ff"
-];
-
-// 사업명별 고정 색상
-const BUSINESS_COLOR_MAP = {
-    "대관":   "#ffe5e5",
-    "지산맞": "#e5f7ff",
-    "일학습": "#e9ffe5",
-    "배터리": "#fff4e5",
-    "기회발전": "#f0e5ff",
-    "사업주": "#ffe5f2"
+const BUSINESS_LIST = ["대관","지산맞","일학습","배터리","기회발전","사업주"];
+const PALETTE = ["#ffe5e5","#e5f7ff","#e9ffe5","#fff4e5","#f0e5ff","#ffe5f2"];
+const BUSINESS_COLOR = {
+    "대관": "#ffe5e5", "지산맞": "#e5f7ff", "일학습": "#e9ffe5",
+    "배터리": "#fff4e5", "기회발전": "#f0e5ff", "사업주": "#ffe5f2"
 };
 
-// 문자열 날짜 d가 [start, end] 범위 안인지 체크
-function inRange(d, start, end) {
-    return (d >= start && d <= end);
-}
+function inRange(d, start, end) { return (d >= start && d <= end); }
 
-// 사업명별 색상 할당 (고정 색상 + 그 외는 팔레트)
 function rebuildColorMap() {
-    // 고정 색상 먼저 세팅
-    colorMap = { ...BUSINESS_COLOR_MAP };
-
-    // 그 외(새로운 사업명)가 나오면 팔레트에서 순차 배정
+    colorMap = {...BUSINESS_COLOR};
     let idx = 0;
     events.forEach(e => {
         const key = e.business || "";
         if (key && !(key in colorMap)) {
-            colorMap[key] = palette[idx % palette.length];
+            colorMap[key] = PALETTE[idx % PALETTE.length];
             idx++;
         }
     });
 }
 
-// 상단 필터용 사업명 드롭다운 재생성 (고정 목록 사용)
 function rebuildBusinessFilter() {
     const select = document.getElementById("businessFilter");
-    if (!select) return;
     const prev = currentBusinessFilter;
     select.innerHTML = '<option value="">전체</option>';
     BUSINESS_LIST.forEach(name => {
@@ -294,92 +248,66 @@ function rebuildBusinessFilter() {
     });
 }
 
-// 폼 안 사업명 선택 상자 재생성 (고정 목록 사용)
 function rebuildBusinessSelect() {
     const sel = document.getElementById("f_business_select");
-    if (!sel) return;
-    const prev = sel.value;
-    sel.innerHTML = '<option value="">(선택하지 않고 직접 입력)</option>';
-    BUSINESS_LIST.forEach(name => {
+    sel.innerHTML = '<option value="">(선택)</option>';
+    BUSINESS_LIST.forEach(n => {
         const opt = document.createElement("option");
-        opt.value = name;
-        opt.textContent = name;
+        opt.value = n;
+        opt.textContent = n;
         sel.appendChild(opt);
     });
-    if (BUSINESS_LIST.includes(prev)) sel.value = prev;
-    else sel.value = "";
 }
 
-// 상단 필터 변경 시
 function onBusinessFilterChange() {
-    const select = document.getElementById("businessFilter");
-    currentBusinessFilter = select ? select.value : "";
+    currentBusinessFilter = document.getElementById("businessFilter").value;
     buildCalendar();
 }
 
-// 필터 초기화 버튼
 function resetFilter() {
     currentBusinessFilter = "";
-    const select = document.getElementById("businessFilter");
-    if (select) select.value = "";
+    document.getElementById("businessFilter").value = "";
     buildCalendar();
 }
 
-// excluded_dates 문자열에 날짜 추가
 function addExcludedDate(oldStr, date) {
-    let arr = [];
-    if (oldStr) {
-        arr = oldStr.split(",").map(s => s.trim()).filter(Boolean);
-    }
-    if (!arr.includes(date)) {
-        arr.push(date);
-    }
+    let arr = oldStr ? oldStr.split(",").map(a => a.trim()) : [];
+    if (!arr.includes(date)) arr.push(date);
     return arr.join(",");
 }
 
 function buildCalendar() {
-    const year = current.getFullYear();
-    const month = current.getMonth();
-    document.getElementById("title").innerText = year + "년 " + (month + 1) + "월";
+    const y = current.getFullYear();
+    const m = current.getMonth();
+    document.getElementById("title").innerText = y + "년 " + (m + 1) + "월";
 
-    const first = new Date(year, month, 1).getDay();
-    const last = new Date(year, month + 1, 0).getDate();
+    const first = new Date(y, m, 1).getDay();
+    const last = new Date(y, m + 1, 0).getDate();
 
     let html = "<table><tr>";
-    const week = ['일','월','화','수','목','금','토'];
-    for (let w of week) html += "<th>" + w + "</th>";
+    for (const w of ["일","월","화","수","목","금","토"]) html += "<th>" + w + "</th>";
     html += "</tr><tr>";
 
     for (let i = 0; i < first; i++) html += "<td></td>";
 
     for (let d = 1; d <= last; d++) {
-        let fd = year + "-" + String(month + 1).padStart(2, '0') + "-" + String(d).padStart(2, '0');
+        let dateStr = y + "-" + String(m + 1).padStart(2,'0') + "-" + String(d).padStart(2,'0');
         html += "<td><b>" + d + "</b>";
 
         events.forEach(e => {
+            if (currentBusinessFilter && e.business !== currentBusinessFilter) return;
             const start = e.start;
-            const end = e.end || e.start;
+            const end = e.end || start;
+            if (!inRange(dateStr, start, end)) return;
 
-            // 상단 사업명 필터 적용
-            if (currentBusinessFilter && (e.business || "") !== currentBusinessFilter) {
-                return;
-            }
+            const excl = (e.excluded_dates || "").split(",").map(a=>a.trim()).filter(Boolean);
+            if (excl.includes(dateStr)) return;
 
-            if (!inRange(fd, start, end)) return;
-
-            // excluded_dates에 해당 날짜가 있으면 이 이벤트는 그 날 숨김
-            const exclStr = e.excluded_dates || "";
-            if (exclStr) {
-                const excl = exclStr.split(",").map(s => s.trim()).filter(Boolean);
-                if (excl.includes(fd)) return;
-            }
-
-            const bg = colorMap[e.business || ""] || "#eef";
+            const bg = colorMap[e.business] || "#eef";
             html += `
                 <div class="event"
-                     data-id="${e.id}"
-                     onclick="editEvent(${e.id}, '${fd}')"
-                     style="background-color:${bg};">
+                     style="background:${bg};"
+                     onclick="editEvent(${e.id}, '${dateStr}')">
                     <span class="title">${e.business || ""}</span>
                     ▪ 과정: ${e.course || ""}<br>
                     ▪ 시간: ${e.time || ""}<br>
@@ -390,214 +318,148 @@ function buildCalendar() {
         });
 
         html += "</td>";
-
         if ((first + d) % 7 === 0) html += "</tr><tr>";
     }
-
     html += "</tr></table>";
     document.getElementById("calendar").innerHTML = html;
 }
 
-function prevMonth() {
-    current.setMonth(current.getMonth() - 1);
-    buildCalendar();
-}
-
-function nextMonth() {
-    current.setMonth(current.getMonth() + 1);
-    buildCalendar();
-}
+function prevMonth() { current.setMonth(current.getMonth() - 1); buildCalendar(); }
+function nextMonth() { current.setMonth(current.getMonth() + 1); buildCalendar(); }
 
 function openFormNew() {
     editingId = null;
     editingDate = null;
     document.getElementById("formTitle").innerText = "일정 추가";
-    document.getElementById("f_start").value = "";
-    document.getElementById("f_end").value = "";
+    ["f_start","f_end","f_business","f_course","f_time","f_people","f_place","f_admin"]
+      .forEach(id => document.getElementById(id).value = "");
     document.getElementById("f_business_select").value = "";
-    document.getElementById("f_business").value = "";
-    document.getElementById("f_course").value = "";
-    document.getElementById("f_time").value = "";
-    document.getElementById("f_people").value = "";
-    document.getElementById("f_place").value = "";
-    document.getElementById("f_admin").value = "";
     document.getElementById("deleteBtn").style.display = "none";
     document.getElementById("formBox").style.display = "block";
     document.getElementById("formOverlay").style.display = "block";
 }
 
-function findEvent(id) {
-    return events.find(e => e.id === id);
-}
-
-function editEvent(id, dateStr) {
-    const e = findEvent(id);
-    if (!e) return;
-    editingId = id;
-    editingDate = dateStr || null;   // 기간 중 클릭한 날짜 기억
-    document.getElementById("formTitle").innerText = "일정 수정";
-    document.getElementById("f_start").value = e.start;
-    document.getElementById("f_end").value = e.end || "";
-    const sel = document.getElementById("f_business_select");
-    const input = document.getElementById("f_business");
-    if (e.business && sel) {
-        if (BUSINESS_LIST.includes(e.business)) {
-            sel.value = e.business;
-            if (input) input.value = "";
-        } else {
-            sel.value = "";
-            if (input) input.value = e.business;
-        }
-    } else {
-        sel.value = "";
-        if (input) input.value = "";
-    }
-    document.getElementById("f_course").value = e.course || "";
-    document.getElementById("f_time").value = e.time || "";
-    document.getElementById("f_people").value = e.people || "";
-    document.getElementById("f_place").value = e.place || "";
-    document.getElementById("f_admin").value = e.admin || "";
-    document.getElementById("deleteBtn").style.display = "inline-block";
-    document.getElementById("formBox").style.display = "block";
-    document.getElementById("formOverlay").style.display = "block";
-}
-
-function closeForm() {
+function closeForm(){
     document.getElementById("formBox").style.display = "none";
     document.getElementById("formOverlay").style.display = "none";
     editingId = null;
     editingDate = null;
 }
 
+function findEvent(id) { return events.find(e => e.id === id); }
+
+function editEvent(id, dateStr){
+    const e = findEvent(id);
+    if (!e) return;
+    editingId = id;
+    editingDate = dateStr;
+    document.getElementById("formTitle").innerText = "일정 수정";
+    document.getElementById("f_start").value = e.start;
+    document.getElementById("f_end").value = e.end;
+    if (BUSINESS_LIST.includes(e.business)) {
+        document.getElementById("f_business_select").value = e.business;
+        document.getElementById("f_business").value = "";
+    } else {
+        document.getElementById("f_business_select").value = "";
+        document.getElementById("f_business").value = e.business;
+    }
+    document.getElementById("f_course").value = e.course;
+    document.getElementById("f_time").value = e.time;
+    document.getElementById("f_people").value = e.people;
+    document.getElementById("f_place").value = e.place;
+    document.getElementById("f_admin").value = e.admin;
+    document.getElementById("deleteBtn").style.display = "inline-block";
+    document.getElementById("formBox").style.display = "block";
+    document.getElementById("formOverlay").style.display = "block";
+}
+
 async function saveEvent() {
     const start = document.getElementById("f_start").value;
-    let end = document.getElementById("f_end").value;
-    const selBusiness = document.getElementById("f_business_select").value;
-    let business = selBusiness || document.getElementById("f_business").value;
+    let end = document.getElementById("f_end").value || start;
+    const sel = document.getElementById("f_business_select").value;
+    const business = sel || document.getElementById("f_business").value;
     const course = document.getElementById("f_course").value;
     const time = document.getElementById("f_time").value;
     const people = document.getElementById("f_people").value;
     const place = document.getElementById("f_place").value;
     const admin = document.getElementById("f_admin").value;
 
-    if (!start) {
-        alert("시작일을 입력해주세요.");
-        return;
-    }
-    if (!end) end = start;
+    if (!start) return alert("시작일은 필수입니다.");
 
-    try {
+    try{
         if (editingId === null) {
-            // 새 일정 추가 (기간 그대로)
             await fetch("/api/events", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    start, end, business, course, time, people, place, admin,
-                    excluded_dates: ""
-                })
+                method:"POST",
+                headers:{"Content-Type":"application/json"},
+                body:JSON.stringify({start,end,business,course,time,people,place,admin,excluded_dates:""})
             });
         } else {
             const original = findEvent(editingId);
-            if (!original) {
-                alert("대상을 찾을 수 없습니다.");
-                return;
-            }
-
-            // ★ A옵션: 기간 일정 중 특정 하루만 수정
-            // editingDate가 있고, 원래 일정이 기간(start != end)이면:
             if (editingDate && original.start !== original.end) {
-                const targetDate = editingDate;
-
-                // 1) 원래 기간 이벤트에서 해당 날짜는 제외시키기 (excluded_dates에 추가)
-                const newExcluded = addExcludedDate(original.excluded_dates || "", targetDate);
+                const newExcluded = addExcludedDate(original.excluded_dates || "", editingDate);
                 await fetch("/api/events/" + editingId, {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        start: original.start,
-                        end: original.end,
-                        business: original.business,
-                        course: original.course,
-                        time: original.time,
-                        people: original.people,
-                        place: original.place,
-                        admin: original.admin,
-                        excluded_dates: newExcluded
+                    method:"PUT",
+                    headers:{"Content-Type":"application/json"},
+                    body:JSON.stringify({
+                        start:original.start,
+                        end:original.end,
+                        business:original.business,
+                        course:original.course,
+                        time:original.time,
+                        people:original.people,
+                        place:original.place,
+                        admin:original.admin,
+                        excluded_dates:newExcluded
                     })
                 });
-
-                // 2) 해당 날짜(targetDate)만을 위한 단일 일정 새로 생성 (수정된 값 반영)
                 await fetch("/api/events", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        start: targetDate,
-                        end: targetDate,
-                        business, course, time, people, place, admin,
-                        excluded_dates: ""
+                    method:"POST",
+                    headers:{"Content-Type":"application/json"},
+                    body:JSON.stringify({
+                        start:editingDate,
+                        end:editingDate,
+                        business,course,time,people,place,admin,
+                        excluded_dates:""
                     })
                 });
             } else {
-                // 단일 일정이거나, 기간 전체를 고치고 싶은 경우: 통째로 수정
                 await fetch("/api/events/" + editingId, {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        start, end, business, course, time, people, place, admin,
-                        excluded_dates: original.excluded_dates || ""
+                    method:"PUT",
+                    headers:{"Content-Type":"application/json"},
+                    body:JSON.stringify({
+                        start,end,business,course,time,people,place,admin,
+                        excluded_dates:original.excluded_dates || ""
                     })
                 });
             }
         }
-
-        // 서버에서 최신 데이터 다시 받아와서 반영
         await loadEvents();
         closeForm();
-    } catch (err) {
-        console.error(err);
-        alert("저장 중 오류가 발생했습니다.");
-    }
+    } catch(e){ alert("저장 실패"); }
 }
 
-async function deleteEvent() {
+async function deleteEvent(){
     if (editingId === null) return;
-    if (!confirm("이 일정을 삭제하시겠습니까?")) return;
-
-    try {
-        await fetch("/api/events/" + editingId, { method: "DELETE" });
-        await loadEvents();
-        closeForm();
-    } catch (err) {
-        console.error(err);
-        alert("삭제 중 오류가 발생했습니다.");
-    }
+    if (!confirm("삭제하시겠습니까?")) return;
+    await fetch("/api/events/" + editingId, {method:"DELETE"});
+    await loadEvents();
+    closeForm();
 }
 
-async function loadEvents() {
-    try {
-        const res = await fetch("/api/events");
-        const json = await res.json();
-        events = json.map(e => ({
-            id: e.id,
-            start: e.start,
-            end: e.end,
-            business: e.business || "",
-            course: e.course || "",
-            time: e.time || "",
-            people: e.people || "",
-            place: e.place || "",
-            admin: e.admin || "",
-            excluded_dates: e.excluded_dates || ""
-        }));
-        rebuildColorMap();
-        rebuildBusinessFilter();
-        rebuildBusinessSelect();
-        buildCalendar();
-    } catch (err) {
-        console.error(err);
-        alert("일정을 불러오는 중 오류가 발생했습니다.");
-    }
+async function loadEvents(){
+    const res = await fetch("/api/events");
+    const json = await res.json();
+    events = json.map(e => ({
+        id:e.id, start:e.start, end:e.end,
+        business:e.business || "", course:e.course || "",
+        time:e.time || "", people:e.people || "",
+        place:e.place || "", admin:e.admin || "",
+        excluded_dates:e.excluded_dates || ""
+    }));
+    rebuildColorMap();
+    rebuildBusinessFilter();
+    rebuildBusinessSelect();
+    buildCalendar();
 }
 
 loadEvents();
@@ -608,100 +470,68 @@ loadEvents();
 """
 
 
-# ---------- Flask 라우트 ----------
+# ---------- API ----------
 @app.route("/")
 def index():
     return INDEX_HTML
 
 
 @app.route("/api/events", methods=["GET"])
-def list_events():
+def get_events():
     conn = get_db()
     rows = conn.execute("SELECT * FROM events ORDER BY start, id").fetchall()
     conn.close()
-    events = [dict(row) for row in rows]
-    return jsonify(events)
+    return jsonify([dict(r) for r in rows])
 
 
 @app.route("/api/events", methods=["POST"])
 def create_event():
-    data = request.get_json(force=True)
-    start = (data.get("start") or "").strip()
-    end = (data.get("end") or start).strip()
-    business = (data.get("business") or "").strip()
-    course = (data.get("course") or "").strip()
-    time_ = (data.get("time") or "").strip()
-    people = (data.get("people") or "").strip()
-    place = (data.get("place") or "").strip()
-    admin = (data.get("admin") or "").strip()
-    excluded = (data.get("excluded_dates") or "").strip()
-
-    if not start:
-        return jsonify({"error": "start is required"}), 400
-    if not end:
-        end = start
-
+    d = request.get_json()
     conn = get_db()
     cur = conn.execute(
-        """
-        INSERT INTO events
-            (start, end, business, course, time, people, place, admin, excluded_dates)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (start, end, business, course, time_, people, place, admin, excluded),
+        """INSERT INTO events (start,end,business,course,time,people,place,admin,excluded_dates)
+        VALUES (?,?,?,?,?,?,?,?,?)""",
+        (
+            d.get("start"), d.get("end"), d.get("business",""),
+            d.get("course",""), d.get("time",""), d.get("people",""),
+            d.get("place",""), d.get("admin",""), d.get("excluded_dates","")
+        )
     )
     conn.commit()
-    event_id = cur.lastrowid
-    row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+    new_id = cur.lastrowid
+    row = conn.execute("SELECT * FROM events WHERE id=?", (new_id,)).fetchone()
     conn.close()
     return jsonify(dict(row)), 201
 
 
 @app.route("/api/events/<int:event_id>", methods=["PUT"])
 def update_event(event_id):
-    data = request.get_json(force=True)
-    start = (data.get("start") or "").strip()
-    end = (data.get("end") or start).strip()
-    business = (data.get("business") or "").strip()
-    course = (data.get("course") or "").strip()
-    time_ = (data.get("time") or "").strip()
-    people = (data.get("people") or "").strip()
-    place = (data.get("place") or "").strip()
-    admin = (data.get("admin") or "").strip()
-    excluded = (data.get("excluded_dates") or "").strip()
-
-    if not start:
-        return jsonify({"error": "start is required"}), 400
-    if not end:
-        end = start
-
+    d = request.get_json()
     conn = get_db()
     conn.execute(
-        """
-        UPDATE events
-           SET start=?, end=?, business=?, course=?, time=?, people=?, place=?, admin=?, excluded_dates=?
-         WHERE id=?
-        """,
-        (start, end, business, course, time_, people, place, admin, excluded, event_id),
+        """UPDATE events SET start=?,end=?,business=?,course=?,time=?,people=?,place=?,admin=?,excluded_dates=? WHERE id=?""",
+        (
+            d.get("start"), d.get("end"), d.get("business",""), d.get("course",""),
+            d.get("time",""), d.get("people",""), d.get("place",""), d.get("admin",""),
+            d.get("excluded_dates",""), event_id
+        )
     )
     conn.commit()
-    row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+    row = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
     conn.close()
-    if row is None:
-        return jsonify({"error": "not found"}), 404
     return jsonify(dict(row))
 
 
 @app.route("/api/events/<int:event_id>", methods=["DELETE"])
-def delete_event_api(event_id):
+def delete_event(event_id):
     conn = get_db()
-    conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
+    conn.execute("DELETE FROM events WHERE id=?", (event_id,))
     conn.commit()
     conn.close()
     return "", 204
 
 
+# ---------- 서버 실행 ----------
 if __name__ == "__main__":
-    init_db()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
