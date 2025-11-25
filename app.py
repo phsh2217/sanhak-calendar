@@ -195,7 +195,7 @@ button { padding: 8px 14px; margin: 0 4px; }
     <div class="form-row">
         사업명(선택): 
         <select id="f_business_select">
-            <option value="">(선택하지 않고 직접 입력)</option>
+            <option value="">(클릭해서 선택)</option>
         </select>
     </div>
     <div class="form-row">
@@ -238,6 +238,17 @@ const palette = [
     "#ffe5e5", "#e5f7ff", "#e9ffe5", "#fff4e5",
     "#f0e5ff", "#ffe5f2", "#e5fff7", "#f5e5ff"
 ];
+
+// 사업명별 고정 색상
+const BUSINESS_COLOR_MAP = {
+    "대관":   "#ffe5e5",
+    "지산맞": "#e5f7ff",
+    "일학습": "#e9ffe5",
+    "배터리": "#fff4e5",
+    "기회발전": "#f0e5ff",
+    "사업주": "#ffe5f2"
+};
+
 
 // 문자열 날짜 d가 [start, end] 범위 안인지 체크
 function inRange(d, start, end) {
@@ -648,3 +659,4 @@ if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
