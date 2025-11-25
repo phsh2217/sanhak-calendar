@@ -255,9 +255,12 @@ function inRange(d, start, end) {
     return (d >= start && d <= end);
 }
 
-// 사업명별 색상 할당
+// 사업명별 색상 할당 (고정 색상 + 그 외는 팔레트)
 function rebuildColorMap() {
-    colorMap = {};
+    // 먼저 고정 색상들 세팅
+    colorMap = { ...BUSINESS_COLOR_MAP };
+
+    // 그 외(새로운 사업명)가 나오면 팔레트에서 순차 배정
     let idx = 0;
     events.forEach(e => {
         const key = e.business || "";
@@ -267,6 +270,7 @@ function rebuildColorMap() {
         }
     });
 }
+
 
 // 상단 필터용 사업명 드롭다운 재생성 (고정 목록 사용)
 function rebuildBusinessFilter() {
@@ -659,4 +663,5 @@ if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
 
