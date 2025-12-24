@@ -447,7 +447,7 @@ INDEX_HTML = r"""
     "일학습":"biz-일학습",
     "배터리":"biz-배터리",
     "기회발전":"biz-기회발전",
-    "사업주":"biz-사업주"
+    "사업주":"biz-사업주",
     "행사":"biz-행사"
   };
 
@@ -730,5 +730,6 @@ def index():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
 
 
