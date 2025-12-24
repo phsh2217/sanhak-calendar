@@ -1,6 +1,4 @@
 import os
-from datetime import datetime, timedelta
-
 import psycopg2
 import psycopg2.extras
 from flask import Flask, request, jsonify
@@ -61,6 +59,19 @@ def row_to_event(row):
     }
 
 
+# excluded_dates: "2025-11-27,2025-11-28" 형태(콤마 문자열) 유지
+def parse_excluded(excluded_str: str):
+    if not excluded_str:
+        return []
+    return [s.strip() for s in excluded_str.split(",") if s.strip()]
+
+
+def dump_excluded(excluded_list):
+    # 중복 제거 + 정렬
+    uniq = sorted(set([d.strip() for d in excluded_list if d and d.strip()]))
+    return ",".join(uniq)
+
+
 @app.route("/api/events", methods=["GET"])
 def api_get_events():
     conn = get_db()
@@ -82,6 +93,10 @@ def api_get_events():
 def api_create_event():
     data = request.json or {}
 
+    # 안전 처리: end 비었으면 start와 동일하게
+    start = data.get("start")
+    end = data.get("end") or start
+
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute(
@@ -91,8 +106,8 @@ def api_create_event():
         RETURNING id, start, "end", business, course, time, people, place, admin, excluded_dates;
         """,
         (
-            data.get("start"),
-            data.get("end"),
+            start,
+            end,
             data.get("business"),
             data.get("course"),
             data.get("time"),
@@ -113,6 +128,9 @@ def api_create_event():
 def api_update_event(event_id):
     data = request.json or {}
 
+    start = data.get("start")
+    end = data.get("end") or start
+
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute(
@@ -131,8 +149,8 @@ def api_update_event(event_id):
         RETURNING id, start, "end", business, course, time, people, place, admin, excluded_dates;
         """,
         (
-            data.get("start"),
-            data.get("end"),
+            start,
+            end,
             data.get("business"),
             data.get("course"),
             data.get("time"),
@@ -167,6 +185,86 @@ def api_delete_event(event_id):
     return jsonify({"status": "deleted"})
 
 
+# ✅ (추가 기능) 특정 날짜만 제외(=그 날짜만 삭제처럼 숨김)
+@app.route("/api/events/<int:event_id>/exclude", methods=["POST"])
+def api_exclude_one_day(event_id):
+    data = request.json or {}
+    date = (data.get("date") or "").strip()  # YYYY-MM-DD
+    if not date:
+        return jsonify({"error": "date is required"}), 400
+
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+    cur.execute("SELECT excluded_dates FROM events WHERE id=%s;", (event_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+
+    excluded = parse_excluded(row["excluded_dates"] or "")
+    if date not in excluded:
+        excluded.append(date)
+
+    new_excluded = dump_excluded(excluded)
+    cur.execute("UPDATE events SET excluded_dates=%s WHERE id=%s;", (new_excluded, event_id))
+    conn.commit()
+
+    # 갱신된 이벤트 반환
+    cur.execute(
+        """
+        SELECT id, start, "end", business, course, time, people, place, admin, excluded_dates
+        FROM events WHERE id=%s;
+        """,
+        (event_id,),
+    )
+    updated = cur.fetchone()
+
+    cur.close()
+    conn.close()
+    return jsonify(row_to_event(updated))
+
+
+# ✅ (추가 기능) 제외 해제(복구)
+@app.route("/api/events/<int:event_id>/exclude", methods=["DELETE"])
+def api_unexclude_one_day(event_id):
+    data = request.json or {}
+    date = (data.get("date") or "").strip()
+    if not date:
+        return jsonify({"error": "date is required"}), 400
+
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+    cur.execute("SELECT excluded_dates FROM events WHERE id=%s;", (event_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+
+    excluded = parse_excluded(row["excluded_dates"] or "")
+    excluded = [d for d in excluded if d != date]
+    new_excluded = dump_excluded(excluded)
+
+    cur.execute("UPDATE events SET excluded_dates=%s WHERE id=%s;", (new_excluded, event_id))
+    conn.commit()
+
+    cur.execute(
+        """
+        SELECT id, start, "end", business, course, time, people, place, admin, excluded_dates
+        FROM events WHERE id=%s;
+        """,
+        (event_id,),
+    )
+    updated = cur.fetchone()
+
+    cur.close()
+    conn.close()
+    return jsonify(row_to_event(updated))
+
+
 # =========================
 # UI
 # =========================
@@ -190,7 +288,6 @@ INDEX_HTML = r"""
     *{box-sizing:border-box;}
     body{margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text);}
 
-    /* ✅ 여백 줄이기 + 폭 넓히기 */
     .container{
       max-width:1600px;
       margin:0 auto;
@@ -219,7 +316,7 @@ INDEX_HTML = r"""
     .calendar th,.calendar td{border:1px solid var(--border);vertical-align:top;}
     .calendar thead th{padding:6px 0;text-align:center;background:#fafafa;font-weight:600;}
     .calendar tbody td{
-      height:125px;
+      height:130px;
       padding:4px;
       position:relative;
       overflow:hidden;
@@ -229,7 +326,7 @@ INDEX_HTML = r"""
     .sun{color:var(--sun);}
     .sat{color:var(--sat);}
 
-    /* ✅ 일정 영역: 2열 배치 */
+    /* 일정 영역: 2열 배치 */
     .events{
       margin-top:4px;
       max-height:calc(100% - 18px);
@@ -250,20 +347,40 @@ INDEX_HTML = r"""
       word-wrap:break-word;
       cursor:pointer;
       min-width:0;
+      position:relative;
     }
 
     .event-business{
       font-weight:600;
       margin-bottom:2px;
-      text-align:center; /* 사업명 가운데 정렬 */
+      text-align:center;
     }
 
     .event-line{
-      white-space:normal; /* ✅ 2열에서 줄바꿈 허용 */
+      white-space:normal;
       line-height:1.15;
     }
 
     .event-dot{margin-right:2px;}
+
+    /* ✅ 날짜별 삭제/복구 버튼 */
+    .event-actions{
+      display:flex;
+      gap:4px;
+      margin-top:4px;
+      justify-content:space-between;
+    }
+    .mini-btn{
+      font-size:10px;
+      padding:3px 6px;
+      border-radius:4px;
+      border:1px solid rgba(0,0,0,0.2);
+      background:#fff;
+      cursor:pointer;
+    }
+    .mini-btn:hover{background:#f3f3f3;}
+    .mini-danger{border-color:#d9363e;color:#d9363e;}
+    .mini-ok{border-color:#1b5fcc;color:#1b5fcc;}
 
     /* 사업별 색상 */
     .biz-대관{background:#ffe6e6;}
@@ -297,13 +414,13 @@ INDEX_HTML = r"""
     .btn-primary{background:#2d89ff;border-color:#1b5fcc;color:#fff;}
     .btn-danger{background:#ff4d4f;border-color:#d9363e;color:#fff;}
 
-    /* 모바일: 1열로 */
     @media (max-width: 768px){
       h1{font-size:22px;}
       .current-month{font-size:17px;}
-      .calendar tbody td{height:145px;}
+      .calendar tbody td{height:155px;}
       .event-card{font-size:12px;}
       .events{grid-template-columns:1fr;}
+      .mini-btn{font-size:11px;}
     }
 
     @media print{
@@ -428,7 +545,7 @@ INDEX_HTML = r"""
     </div>
 
     <div class="modal-footer">
-      <button class="btn-danger" id="deleteEventBtn" style="display:none;">삭제</button>
+      <button class="btn-danger" id="deleteEventBtn" style="display:none;">전체 삭제</button>
       <div style="flex:1;"></div>
       <button id="cancelBtn">취소</button>
       <button class="btn-primary" id="saveEventBtn">저장</button>
@@ -451,6 +568,12 @@ INDEX_HTML = r"""
     "행사":"biz-행사"
   };
 
+  function escapeHtml(str){
+    return String(str ?? "")
+      .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+      .replaceAll('"',"&quot;").replaceAll("'","&#039;");
+  }
+
   function formatDate(d){
     const y = d.getFullYear();
     const m = String(d.getMonth()+1).padStart(2,"0");
@@ -461,25 +584,35 @@ INDEX_HTML = r"""
     const [y,m,d] = str.split("-").map(Number);
     return new Date(y, m-1, d);
   }
+
+  function parseExcluded(excludedStr){
+    return (excludedStr || "")
+      .split(",")
+      .map(s=>s.trim())
+      .filter(Boolean);
+  }
+  function joinExcluded(arr){
+    const uniq = Array.from(new Set(arr.filter(Boolean))).sort();
+    return uniq.join(",");
+  }
+
+  // ✅ 기간(start~end) -> 날짜 배열 생성 (excluded_dates 제외)
   function getRangeDates(startStr, endStr, excludedStr){
     const dates = [];
     if(!startStr || !endStr) return dates;
 
     let current = parseDate(startStr);
     const end = parseDate(endStr);
-
-    const excluded = (excludedStr || "")
-      .split(",")
-      .map(s=>s.trim())
-      .filter(Boolean);
+    const excluded = new Set(parseExcluded(excludedStr));
 
     while(current <= end){
       const iso = formatDate(current);
-      if(!excluded.includes(iso)) dates.push(iso);
+      if(!excluded.has(iso)) dates.push(iso);
       current.setDate(current.getDate()+1);
     }
     return dates;
   }
+
   function getBusinessClass(biz){
     return businessColors[biz] || "biz-기타";
   }
@@ -516,7 +649,7 @@ INDEX_HTML = r"""
   }
 
   async function deleteEvent(id){
-    if(!confirm("정말 삭제하시겠습니까?")) return;
+    if(!confirm("이 일정(기간 전체)을 삭제하시겠습니까?")) return;
     const res = await fetch(`/api/events/${id}`,{method:"DELETE"});
     if(!res.ok){ alert("삭제 실패"); return; }
     allEvents = allEvents.filter(ev=>ev.id!==id);
@@ -524,13 +657,44 @@ INDEX_HTML = r"""
     closeModal();
   }
 
+  // ✅ 특정 날짜만 삭제(숨김) = exclude
+  async function excludeOneDay(eventId, day){
+    if(!confirm(`${day} 날짜만 삭제(숨김)할까요?`)) return;
+
+    const res = await fetch(`/api/events/${eventId}/exclude`,{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({date: day})
+    });
+    if(!res.ok){ alert("날짜 삭제 중 오류"); return; }
+
+    const updated = await res.json();
+    allEvents = allEvents.map(ev=>ev.id===updated.id?updated:ev);
+    renderCalendar();
+  }
+
+  // ✅ 특정 날짜 삭제 취소(복구) = unexclude
+  async function unexcludeOneDay(eventId, day){
+    if(!confirm(`${day} 날짜 삭제를 취소(복구)할까요?`)) return;
+
+    const res = await fetch(`/api/events/${eventId}/exclude`,{
+      method:"DELETE",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({date: day})
+    });
+    if(!res.ok){ alert("복구 중 오류"); return; }
+
+    const updated = await res.json();
+    allEvents = allEvents.map(ev=>ev.id===updated.id?updated:ev);
+    renderCalendar();
+  }
+
   function renderCalendar(){
     const body = document.getElementById("calendarBody");
     body.innerHTML = "";
 
     const firstDay = new Date(currentYear, currentMonth, 1);
-    const monthName = `${currentYear}년 ${currentMonth+1}월`;
-    document.getElementById("currentMonth").textContent = monthName;
+    document.getElementById("currentMonth").textContent = `${currentYear}년 ${currentMonth+1}월`;
 
     const businessFilter = document.getElementById("businessFilter").value;
 
@@ -564,6 +728,8 @@ INDEX_HTML = r"""
         if(cellMonth === currentMonth){
           allEvents.forEach(ev=>{
             if(businessFilter !== "전체" && ev.business !== businessFilter) return;
+
+            // ✅ 기간에 해당하는 모든 날짜 표시
             const dates = getRangeDates(ev.start, ev.end, ev.excluded_dates);
             if(!dates.includes(iso)) return;
 
@@ -577,23 +743,46 @@ INDEX_HTML = r"""
 
             const courseDiv = document.createElement("div");
             courseDiv.className = "event-line";
-            courseDiv.innerHTML = `<span class="event-dot">▪</span>과정: ${ev.course || ""}`;
+            courseDiv.innerHTML = `<span class="event-dot">▪</span>과정: ${escapeHtml(ev.course || "")}`;
 
             const timeDiv = document.createElement("div");
             timeDiv.className = "event-line";
-            timeDiv.innerHTML = `<span class="event-dot">▪</span>시간: ${ev.time || ""}`;
+            timeDiv.innerHTML = `<span class="event-dot">▪</span>시간: ${escapeHtml(ev.time || "")}`;
 
             const peopleDiv = document.createElement("div");
             peopleDiv.className = "event-line";
-            peopleDiv.innerHTML = `<span class="event-dot">▪</span>인원: ${ev.people || ""}`;
+            peopleDiv.innerHTML = `<span class="event-dot">▪</span>인원: ${escapeHtml(ev.people || "")}`;
 
             const placeDiv = document.createElement("div");
             placeDiv.className = "event-line";
-            placeDiv.innerHTML = `<span class="event-dot">▪</span>장소: ${ev.place || ""}`;
+            placeDiv.innerHTML = `<span class="event-dot">▪</span>장소: ${escapeHtml(ev.place || "")}`;
 
             const adminDiv = document.createElement("div");
             adminDiv.className = "event-line";
-            adminDiv.innerHTML = `<span class="event-dot">▪</span>행정: ${ev.admin || ""}`;
+            adminDiv.innerHTML = `<span class="event-dot">▪</span>행정: ${escapeHtml(ev.admin || "")}`;
+
+            // ✅ 이 날짜만 삭제/복구 버튼
+            const actions = document.createElement("div");
+            actions.className = "event-actions";
+
+            const btnDelDay = document.createElement("button");
+            btnDelDay.className = "mini-btn mini-danger";
+            btnDelDay.textContent = "이날 삭제";
+            btnDelDay.addEventListener("click", (e)=>{
+              e.stopPropagation(); // 카드 클릭(수정 모달) 방지
+              excludeOneDay(ev.id, iso);
+            });
+
+            const btnUndo = document.createElement("button");
+            btnUndo.className = "mini-btn mini-ok";
+            btnUndo.textContent = "복구";
+            btnUndo.addEventListener("click", (e)=>{
+              e.stopPropagation();
+              unexcludeOneDay(ev.id, iso);
+            });
+
+            actions.appendChild(btnDelDay);
+            actions.appendChild(btnUndo);
 
             card.appendChild(bizDiv);
             card.appendChild(courseDiv);
@@ -601,6 +790,7 @@ INDEX_HTML = r"""
             card.appendChild(peopleDiv);
             card.appendChild(placeDiv);
             card.appendChild(adminDiv);
+            card.appendChild(actions);
 
             eventsDiv.appendChild(card);
           });
@@ -683,9 +873,21 @@ INDEX_HTML = r"""
     document.getElementById("cancelBtn").addEventListener("click", closeModal);
 
     document.getElementById("saveEventBtn").addEventListener("click", async ()=>{
+      let start = document.getElementById("startDate").value;
+      let end = document.getElementById("endDate").value || start;
+
+      if(!start){
+        alert("시작일을 입력해주세요.");
+        return;
+      }
+      // start > end이면 스왑
+      if(end && start > end){
+        const tmp = start; start = end; end = tmp;
+      }
+
       const payload = {
-        start: document.getElementById("startDate").value,
-        end: document.getElementById("endDate").value,
+        start: start,
+        end: end,
         business: document.getElementById("business").value || null,
         course: document.getElementById("course").value || null,
         time: document.getElementById("time").value || null,
@@ -694,11 +896,6 @@ INDEX_HTML = r"""
         admin: document.getElementById("admin").value || null,
         excluded_dates: document.getElementById("excludedDates").value || ""
       };
-
-      if(!payload.start || !payload.end){
-        alert("시작일과 종료일을 입력해주세요.");
-        return;
-      }
 
       if(mode==="create"){
         await createEvent(payload);
@@ -730,6 +927,3 @@ def index():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
-
-
-
