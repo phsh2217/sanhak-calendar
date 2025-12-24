@@ -272,6 +272,7 @@ INDEX_HTML = r"""
     .biz-배터리{background:#e9ffe6;}
     .biz-기회발전{background:#f4e6ff;}
     .biz-사업주{background:#fce6f2;}
+    .biz-행사{background:#ff99cc;}
     .biz-기타{background:#f0f0f0;}
 
     /* 모달 */
@@ -332,6 +333,7 @@ INDEX_HTML = r"""
           <option value="배터리">배터리</option>
           <option value="기회발전">기회발전</option>
           <option value="사업주">사업주</option>
+          <option value="행사">행사</option>
         </select>
       </label>
       <button id="resetFilterBtn">필터 초기화</button>
@@ -388,6 +390,7 @@ INDEX_HTML = r"""
           <option value="배터리">배터리</option>
           <option value="기회발전">기회발전</option>
           <option value="사업주">사업주</option>
+          <option value="행사">행사</option>
         </select>
       </div>
 
@@ -445,6 +448,7 @@ INDEX_HTML = r"""
     "배터리":"biz-배터리",
     "기회발전":"biz-기회발전",
     "사업주":"biz-사업주"
+    "행사":"biz-행사"
   };
 
   function formatDate(d){
@@ -726,4 +730,5 @@ def index():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
 
