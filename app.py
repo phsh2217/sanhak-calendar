@@ -192,7 +192,7 @@ INDEX_HTML = r"""
 
     /* ✅ 여백 줄이기 + 폭 넓히기 */
     .container{
-      max-width:1400px;
+      max-width:1600px;
       margin:0 auto;
       padding:10px 10px;
     }
@@ -726,3 +726,4 @@ def index():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
