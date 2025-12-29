@@ -14,6 +14,9 @@ if not DATABASE_URL:
 # DB
 # =========================
 def get_db():
+    # Render Postgres는 보통 ssl 필요(Internal URL은 필요 없을 때도 있음). 필요 시 Render가 자동 처리하는 경우가 많음.
+    # 만약 연결 오류가 나면 아래처럼 sslmode=require 추가를 고려:
+    # return psycopg2.connect(DATABASE_URL, sslmode="require")
     return psycopg2.connect(DATABASE_URL)
 
 
@@ -59,19 +62,21 @@ def row_to_event(row):
     }
 
 
-# excluded_dates: "2025-11-27,2025-11-28" 형태(콤마 문자열) 유지
-def parse_excluded(excluded_str: str):
+def normalize_excluded(excluded_str: str) -> list[str]:
     if not excluded_str:
         return []
-    return [s.strip() for s in excluded_str.split(",") if s.strip()]
+    items = [s.strip() for s in excluded_str.split(",") if s.strip()]
+    # 중복 제거 + 정렬(문자열 yyyy-mm-dd라 정렬 OK)
+    return sorted(set(items))
 
 
-def dump_excluded(excluded_list):
-    # 중복 제거 + 정렬
-    uniq = sorted(set([d.strip() for d in excluded_list if d and d.strip()]))
-    return ",".join(uniq)
+def excluded_to_str(excluded_list: list[str]) -> str:
+    return ",".join(excluded_list)
 
 
+# =========================
+# API
+# =========================
 @app.route("/api/events", methods=["GET"])
 def api_get_events():
     conn = get_db()
@@ -93,10 +98,6 @@ def api_get_events():
 def api_create_event():
     data = request.json or {}
 
-    # 안전 처리: end 비었으면 start와 동일하게
-    start = data.get("start")
-    end = data.get("end") or start
-
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute(
@@ -106,8 +107,8 @@ def api_create_event():
         RETURNING id, start, "end", business, course, time, people, place, admin, excluded_dates;
         """,
         (
-            start,
-            end,
+            data.get("start"),
+            data.get("end"),
             data.get("business"),
             data.get("course"),
             data.get("time"),
@@ -128,9 +129,6 @@ def api_create_event():
 def api_update_event(event_id):
     data = request.json or {}
 
-    start = data.get("start")
-    end = data.get("end") or start
-
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute(
@@ -149,8 +147,8 @@ def api_update_event(event_id):
         RETURNING id, start, "end", business, course, time, people, place, admin, excluded_dates;
         """,
         (
-            start,
-            end,
+            data.get("start"),
+            data.get("end"),
             data.get("business"),
             data.get("course"),
             data.get("time"),
@@ -185,88 +183,54 @@ def api_delete_event(event_id):
     return jsonify({"status": "deleted"})
 
 
-# ✅ (추가 기능) 특정 날짜만 제외(=그 날짜만 삭제처럼 숨김)
+# ✅ "이날 삭제"용: excluded_dates에 특정 날짜 추가
 @app.route("/api/events/<int:event_id>/exclude", methods=["POST"])
 def api_exclude_one_day(event_id):
     data = request.json or {}
-    date = (data.get("date") or "").strip()  # YYYY-MM-DD
-    if not date:
+    date_str = (data.get("date") or "").strip()
+    if not date_str:
         return jsonify({"error": "date is required"}), 400
 
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-    cur.execute("SELECT excluded_dates FROM events WHERE id=%s;", (event_id,))
+    cur.execute(
+        """
+        SELECT id, start, "end", business, course, time, people, place, admin, excluded_dates
+        FROM events
+        WHERE id=%s;
+        """,
+        (event_id,),
+    )
     row = cur.fetchone()
     if not row:
         cur.close()
         conn.close()
         return jsonify({"error": "not found"}), 404
 
-    excluded = parse_excluded(row["excluded_dates"] or "")
-    if date not in excluded:
-        excluded.append(date)
-
-    new_excluded = dump_excluded(excluded)
-    cur.execute("UPDATE events SET excluded_dates=%s WHERE id=%s;", (new_excluded, event_id))
-    conn.commit()
-
-    # 갱신된 이벤트 반환
-    cur.execute(
-        """
-        SELECT id, start, "end", business, course, time, people, place, admin, excluded_dates
-        FROM events WHERE id=%s;
-        """,
-        (event_id,),
-    )
-    updated = cur.fetchone()
-
-    cur.close()
-    conn.close()
-    return jsonify(row_to_event(updated))
-
-
-# ✅ (추가 기능) 제외 해제(복구)
-@app.route("/api/events/<int:event_id>/exclude", methods=["DELETE"])
-def api_unexclude_one_day(event_id):
-    data = request.json or {}
-    date = (data.get("date") or "").strip()
-    if not date:
-        return jsonify({"error": "date is required"}), 400
-
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-
-    cur.execute("SELECT excluded_dates FROM events WHERE id=%s;", (event_id,))
-    row = cur.fetchone()
-    if not row:
-        cur.close()
-        conn.close()
-        return jsonify({"error": "not found"}), 404
-
-    excluded = parse_excluded(row["excluded_dates"] or "")
-    excluded = [d for d in excluded if d != date]
-    new_excluded = dump_excluded(excluded)
-
-    cur.execute("UPDATE events SET excluded_dates=%s WHERE id=%s;", (new_excluded, event_id))
-    conn.commit()
+    excluded_list = normalize_excluded(row["excluded_dates"] or "")
+    excluded_list.append(date_str)
+    excluded_list = sorted(set(excluded_list))
+    new_excluded = excluded_to_str(excluded_list)
 
     cur.execute(
         """
-        SELECT id, start, "end", business, course, time, people, place, admin, excluded_dates
-        FROM events WHERE id=%s;
+        UPDATE events
+        SET excluded_dates=%s
+        WHERE id=%s
+        RETURNING id, start, "end", business, course, time, people, place, admin, excluded_dates;
         """,
-        (event_id,),
+        (new_excluded, event_id),
     )
     updated = cur.fetchone()
-
+    conn.commit()
     cur.close()
     conn.close()
     return jsonify(row_to_event(updated))
 
 
 # =========================
-# UI
+# UI (Single-file)
 # =========================
 INDEX_HTML = r"""
 <!DOCTYPE html>
@@ -316,7 +280,7 @@ INDEX_HTML = r"""
     .calendar th,.calendar td{border:1px solid var(--border);vertical-align:top;}
     .calendar thead th{padding:6px 0;text-align:center;background:#fafafa;font-weight:600;}
     .calendar tbody td{
-      height:130px;
+      height:125px;
       padding:4px;
       position:relative;
       overflow:hidden;
@@ -326,7 +290,7 @@ INDEX_HTML = r"""
     .sun{color:var(--sun);}
     .sat{color:var(--sat);}
 
-    /* 일정 영역: 2열 배치 */
+    /* ✅ 일정 영역: 2열 배치 */
     .events{
       margin-top:4px;
       max-height:calc(100% - 18px);
@@ -347,40 +311,20 @@ INDEX_HTML = r"""
       word-wrap:break-word;
       cursor:pointer;
       min-width:0;
-      position:relative;
     }
 
     .event-business{
       font-weight:600;
       margin-bottom:2px;
-      text-align:center;
+      text-align:center; /* 사업명 가운데 정렬 */
     }
 
     .event-line{
-      white-space:normal;
+      white-space:normal; /* ✅ 2열에서 줄바꿈 허용 */
       line-height:1.15;
     }
 
     .event-dot{margin-right:2px;}
-
-    /* ✅ 날짜별 삭제/복구 버튼 */
-    .event-actions{
-      display:flex;
-      gap:4px;
-      margin-top:4px;
-      justify-content:space-between;
-    }
-    .mini-btn{
-      font-size:10px;
-      padding:3px 6px;
-      border-radius:4px;
-      border:1px solid rgba(0,0,0,0.2);
-      background:#fff;
-      cursor:pointer;
-    }
-    .mini-btn:hover{background:#f3f3f3;}
-    .mini-danger{border-color:#d9363e;color:#d9363e;}
-    .mini-ok{border-color:#1b5fcc;color:#1b5fcc;}
 
     /* 사업별 색상 */
     .biz-대관{background:#ffe6e6;}
@@ -410,23 +354,27 @@ INDEX_HTML = r"""
     textarea{resize:vertical;}
     .field-inline{display:flex;gap:6px;}
     .field-inline .field{flex:1;margin-bottom:0;}
-    .modal-footer{display:flex;justify-content:space-between;gap:4px;margin-top:8px;}
+    .modal-footer{display:flex;justify-content:space-between;gap:4px;margin-top:8px;flex-wrap:wrap;}
     .btn-primary{background:#2d89ff;border-color:#1b5fcc;color:#fff;}
     .btn-danger{background:#ff4d4f;border-color:#d9363e;color:#fff;}
+    .mini-btn{padding:6px 10px;border-radius:4px;border:1px solid #ccc;background:#f7f7f7;cursor:pointer;}
+    .mini-danger{background:#ff4d4f;border-color:#d9363e;color:#fff;}
 
+    /* 모바일: 1열로 */
     @media (max-width: 768px){
       h1{font-size:22px;}
       .current-month{font-size:17px;}
-      .calendar tbody td{height:155px;}
+      .calendar tbody td{height:145px;}
       .event-card{font-size:12px;}
       .events{grid-template-columns:1fr;}
-      .mini-btn{font-size:11px;}
     }
 
     @media print{
       .top-bar,.modal-backdrop{display:none !important;}
       .container{margin:0;max-width:100%;padding:0;}
       body{background:#fff;}
+      /* ✅ 인쇄 색상 유지(브라우저 설정에 따라 제한될 수 있음) */
+      *{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }
     }
   </style>
 </head>
@@ -437,8 +385,11 @@ INDEX_HTML = r"""
 
   <div class="top-bar">
     <div class="top-left">
-      <button id="prevMonthBtn">◀ 이전달</button>
-      <button id="nextMonthBtn">다음달 ▶</button>
+      <button id="prevBtn">◀ 이전</button>
+      <button id="nextBtn">다음 ▶</button>
+
+      <button id="monthViewBtn">월별</button>
+      <button id="weekViewBtn">주별</button>
 
       <label>
         사업명:
@@ -486,6 +437,8 @@ INDEX_HTML = r"""
 
     <div class="modal-body">
       <input type="hidden" id="eventId">
+      <input type="hidden" id="clickedDay">
+
       <div class="field-inline">
         <div class="field">
           <label for="startDate">시작일</label>
@@ -546,6 +499,10 @@ INDEX_HTML = r"""
 
     <div class="modal-footer">
       <button class="btn-danger" id="deleteEventBtn" style="display:none;">전체 삭제</button>
+
+      <!-- ✅ 이벤트(해당 날짜) 클릭으로 들어온 경우에만 표시 -->
+      <button class="mini-btn mini-danger" id="deleteOneDayBtn" style="display:none;">이날 삭제</button>
+
       <div style="flex:1;"></div>
       <button id="cancelBtn">취소</button>
       <button class="btn-primary" id="saveEventBtn">저장</button>
@@ -558,6 +515,10 @@ INDEX_HTML = r"""
   let currentYear, currentMonth;
   let mode = "create";
 
+  // ✅ 월/주 보기
+  let viewMode = "month"; // "month" | "week"
+  let anchorDate = new Date(); // 주별 보기 기준
+
   const businessColors = {
     "대관":"biz-대관",
     "지산맞":"biz-지산맞",
@@ -568,10 +529,14 @@ INDEX_HTML = r"""
     "행사":"biz-행사"
   };
 
-  function escapeHtml(str){
-    return String(str ?? "")
-      .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
-      .replaceAll('"',"&quot;").replaceAll("'","&#039;");
+  function escapeHtml(s){
+    if(s === null || s === undefined) return "";
+    return String(s)
+      .replaceAll("&","&amp;")
+      .replaceAll("<","&lt;")
+      .replaceAll(">","&gt;")
+      .replaceAll('"',"&quot;")
+      .replaceAll("'","&#39;");
   }
 
   function formatDate(d){
@@ -585,29 +550,28 @@ INDEX_HTML = r"""
     return new Date(y, m-1, d);
   }
 
-  function parseExcluded(excludedStr){
-    return (excludedStr || "")
-      .split(",")
-      .map(s=>s.trim())
-      .filter(Boolean);
-  }
-  function joinExcluded(arr){
-    const uniq = Array.from(new Set(arr.filter(Boolean))).sort();
-    return uniq.join(",");
+  function startOfWeek(d){
+    const x = new Date(d);
+    x.setHours(0,0,0,0);
+    x.setDate(x.getDate() - x.getDay()); // 일요일 시작
+    return x;
   }
 
-  // ✅ 기간(start~end) -> 날짜 배열 생성 (excluded_dates 제외)
   function getRangeDates(startStr, endStr, excludedStr){
     const dates = [];
     if(!startStr || !endStr) return dates;
 
     let current = parseDate(startStr);
     const end = parseDate(endStr);
-    const excluded = new Set(parseExcluded(excludedStr));
+
+    const excluded = (excludedStr || "")
+      .split(",")
+      .map(s=>s.trim())
+      .filter(Boolean);
 
     while(current <= end){
       const iso = formatDate(current);
-      if(!excluded.has(iso)) dates.push(iso);
+      if(!excluded.includes(iso)) dates.push(iso);
       current.setDate(current.getDate()+1);
     }
     return dates;
@@ -649,7 +613,7 @@ INDEX_HTML = r"""
   }
 
   async function deleteEvent(id){
-    if(!confirm("이 일정(기간 전체)을 삭제하시겠습니까?")) return;
+    if(!confirm("정말 삭제하시겠습니까?")) return;
     const res = await fetch(`/api/events/${id}`,{method:"DELETE"});
     if(!res.ok){ alert("삭제 실패"); return; }
     allEvents = allEvents.filter(ev=>ev.id!==id);
@@ -657,39 +621,28 @@ INDEX_HTML = r"""
     closeModal();
   }
 
-  // ✅ 특정 날짜만 삭제(숨김) = exclude
-  async function excludeOneDay(eventId, day){
-    if(!confirm(`${day} 날짜만 삭제(숨김)할까요?`)) return;
-
-    const res = await fetch(`/api/events/${eventId}/exclude`,{
+  async function excludeOneDay(id, dateStr){
+    const res = await fetch(`/api/events/${id}/exclude`,{
       method:"POST",
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({date: day})
+      body: JSON.stringify({date: dateStr})
     });
-    if(!res.ok){ alert("날짜 삭제 중 오류"); return; }
-
+    if(!res.ok){ alert("이날 삭제 실패"); return; }
     const updated = await res.json();
-    allEvents = allEvents.map(ev=>ev.id===updated.id?updated:ev);
-    renderCalendar();
-  }
-
-  // ✅ 특정 날짜 삭제 취소(복구) = unexclude
-  async function unexcludeOneDay(eventId, day){
-    if(!confirm(`${day} 날짜 삭제를 취소(복구)할까요?`)) return;
-
-    const res = await fetch(`/api/events/${eventId}/exclude`,{
-      method:"DELETE",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({date: day})
-    });
-    if(!res.ok){ alert("복구 중 오류"); return; }
-
-    const updated = await res.json();
-    allEvents = allEvents.map(ev=>ev.id===updated.id?updated:ev);
+    allEvents = allEvents.map(ev=>ev.id===id?updated:ev);
     renderCalendar();
   }
 
   function renderCalendar(){
+    if(viewMode === "week"){
+      renderWeek();
+    }else{
+      renderMonth();
+    }
+  }
+
+  // ✅ 월별 렌더링(기존 달력)
+  function renderMonth(){
     const body = document.getElementById("calendarBody");
     body.innerHTML = "";
 
@@ -728,14 +681,13 @@ INDEX_HTML = r"""
         if(cellMonth === currentMonth){
           allEvents.forEach(ev=>{
             if(businessFilter !== "전체" && ev.business !== businessFilter) return;
-
-            // ✅ 기간에 해당하는 모든 날짜 표시
             const dates = getRangeDates(ev.start, ev.end, ev.excluded_dates);
             if(!dates.includes(iso)) return;
 
             const card = document.createElement("div");
             card.className = "event-card " + getBusinessClass(ev.business || "");
-            card.addEventListener("click", ()=>openEditModal(ev));
+            // ✅ 날짜를 같이 넘겨서 '이날 삭제' 가능
+            card.addEventListener("click", ()=>openEditModal(ev, iso));
 
             const bizDiv = document.createElement("div");
             bizDiv.className = "event-business";
@@ -743,46 +695,23 @@ INDEX_HTML = r"""
 
             const courseDiv = document.createElement("div");
             courseDiv.className = "event-line";
-            courseDiv.innerHTML = `<span class="event-dot">▪</span>과정: ${escapeHtml(ev.course || "")}`;
+            courseDiv.innerHTML = `<span class="event-dot">▪</span>과정: ${escapeHtml(ev.course)}`;
 
             const timeDiv = document.createElement("div");
             timeDiv.className = "event-line";
-            timeDiv.innerHTML = `<span class="event-dot">▪</span>시간: ${escapeHtml(ev.time || "")}`;
+            timeDiv.innerHTML = `<span class="event-dot">▪</span>시간: ${escapeHtml(ev.time)}`;
 
             const peopleDiv = document.createElement("div");
             peopleDiv.className = "event-line";
-            peopleDiv.innerHTML = `<span class="event-dot">▪</span>인원: ${escapeHtml(ev.people || "")}`;
+            peopleDiv.innerHTML = `<span class="event-dot">▪</span>인원: ${escapeHtml(ev.people)}`;
 
             const placeDiv = document.createElement("div");
             placeDiv.className = "event-line";
-            placeDiv.innerHTML = `<span class="event-dot">▪</span>장소: ${escapeHtml(ev.place || "")}`;
+            placeDiv.innerHTML = `<span class="event-dot">▪</span>장소: ${escapeHtml(ev.place)}`;
 
             const adminDiv = document.createElement("div");
             adminDiv.className = "event-line";
-            adminDiv.innerHTML = `<span class="event-dot">▪</span>행정: ${escapeHtml(ev.admin || "")}`;
-
-            // ✅ 이 날짜만 삭제/복구 버튼
-            const actions = document.createElement("div");
-            actions.className = "event-actions";
-
-            const btnDelDay = document.createElement("button");
-            btnDelDay.className = "mini-btn mini-danger";
-            btnDelDay.textContent = "이날 삭제";
-            btnDelDay.addEventListener("click", (e)=>{
-              e.stopPropagation(); // 카드 클릭(수정 모달) 방지
-              excludeOneDay(ev.id, iso);
-            });
-
-            const btnUndo = document.createElement("button");
-            btnUndo.className = "mini-btn mini-ok";
-            btnUndo.textContent = "복구";
-            btnUndo.addEventListener("click", (e)=>{
-              e.stopPropagation();
-              unexcludeOneDay(ev.id, iso);
-            });
-
-            actions.appendChild(btnDelDay);
-            actions.appendChild(btnUndo);
+            adminDiv.innerHTML = `<span class="event-dot">▪</span>행정: ${escapeHtml(ev.admin)}`;
 
             card.appendChild(bizDiv);
             card.appendChild(courseDiv);
@@ -790,7 +719,6 @@ INDEX_HTML = r"""
             card.appendChild(peopleDiv);
             card.appendChild(placeDiv);
             card.appendChild(adminDiv);
-            card.appendChild(actions);
 
             eventsDiv.appendChild(card);
           });
@@ -806,10 +734,93 @@ INDEX_HTML = r"""
     }
   }
 
+  // ✅ 주별 렌더링(1주 7칸만)
+  function renderWeek(){
+    const body = document.getElementById("calendarBody");
+    body.innerHTML = "";
+
+    const ws = startOfWeek(anchorDate);
+    const we = new Date(ws); we.setDate(we.getDate()+6);
+
+    document.getElementById("currentMonth").textContent =
+      `${ws.getFullYear()}년 ${ws.getMonth()+1}월 (주별: ${formatDate(ws)} ~ ${formatDate(we)})`;
+
+    const businessFilter = document.getElementById("businessFilter").value;
+
+    const tr = document.createElement("tr");
+
+    for(let dow=0; dow<7; dow++){
+      const d = new Date(ws);
+      d.setDate(d.getDate()+dow);
+
+      const td = document.createElement("td");
+      const iso = formatDate(d);
+
+      const dayNumDiv = document.createElement("div");
+      dayNumDiv.className = "day-number";
+      if(dow===0) dayNumDiv.classList.add("sun");
+      if(dow===6) dayNumDiv.classList.add("sat");
+      dayNumDiv.textContent = d.getDate();
+      td.appendChild(dayNumDiv);
+
+      const eventsDiv = document.createElement("div");
+      eventsDiv.className = "events";
+      td.appendChild(eventsDiv);
+
+      allEvents.forEach(ev=>{
+        if(businessFilter !== "전체" && ev.business !== businessFilter) return;
+        const dates = getRangeDates(ev.start, ev.end, ev.excluded_dates);
+        if(!dates.includes(iso)) return;
+
+        const card = document.createElement("div");
+        card.className = "event-card " + getBusinessClass(ev.business || "");
+        card.addEventListener("click", ()=>openEditModal(ev, iso));
+
+        const bizDiv = document.createElement("div");
+        bizDiv.className = "event-business";
+        bizDiv.textContent = ev.business || "사업명 없음";
+
+        const courseDiv = document.createElement("div");
+        courseDiv.className = "event-line";
+        courseDiv.innerHTML = `<span class="event-dot">▪</span>과정: ${escapeHtml(ev.course)}`;
+
+        const timeDiv = document.createElement("div");
+        timeDiv.className = "event-line";
+        timeDiv.innerHTML = `<span class="event-dot">▪</span>시간: ${escapeHtml(ev.time)}`;
+
+        const peopleDiv = document.createElement("div");
+        peopleDiv.className = "event-line";
+        peopleDiv.innerHTML = `<span class="event-dot">▪</span>인원: ${escapeHtml(ev.people)}`;
+
+        const placeDiv = document.createElement("div");
+        placeDiv.className = "event-line";
+        placeDiv.innerHTML = `<span class="event-dot">▪</span>장소: ${escapeHtml(ev.place)}`;
+
+        const adminDiv = document.createElement("div");
+        adminDiv.className = "event-line";
+        adminDiv.innerHTML = `<span class="event-dot">▪</span>행정: ${escapeHtml(ev.admin)}`;
+
+        card.appendChild(bizDiv);
+        card.appendChild(courseDiv);
+        card.appendChild(timeDiv);
+        card.appendChild(peopleDiv);
+        card.appendChild(placeDiv);
+        card.appendChild(adminDiv);
+
+        eventsDiv.appendChild(card);
+      });
+
+      tr.appendChild(td);
+    }
+
+    body.appendChild(tr);
+  }
+
   function openCreateModal(dateStr){
     mode="create";
     document.getElementById("modalTitle").textContent="일정 추가";
     document.getElementById("eventId").value="";
+    document.getElementById("clickedDay").value=""; // 생성은 날짜 클릭 개념 없음
     document.getElementById("startDate").value=dateStr||"";
     document.getElementById("endDate").value=dateStr||"";
     document.getElementById("business").value="";
@@ -820,13 +831,17 @@ INDEX_HTML = r"""
     document.getElementById("admin").value="";
     document.getElementById("excludedDates").value="";
     document.getElementById("deleteEventBtn").style.display="none";
+    document.getElementById("deleteOneDayBtn").style.display="none";
     document.getElementById("modalBackdrop").style.display="flex";
   }
 
-  function openEditModal(ev){
+  // ✅ 클릭한 날짜(clickedDay)를 받아서 '이날 삭제' 가능하게
+  function openEditModal(ev, clickedDay){
     mode="edit";
     document.getElementById("modalTitle").textContent="일정 수정";
     document.getElementById("eventId").value=ev.id;
+    document.getElementById("clickedDay").value = clickedDay || "";
+
     document.getElementById("startDate").value=ev.start;
     document.getElementById("endDate").value=ev.end;
     document.getElementById("business").value=ev.business||"";
@@ -836,7 +851,9 @@ INDEX_HTML = r"""
     document.getElementById("place").value=ev.place||"";
     document.getElementById("admin").value=ev.admin||"";
     document.getElementById("excludedDates").value=ev.excluded_dates||"";
+
     document.getElementById("deleteEventBtn").style.display="inline-block";
+    document.getElementById("deleteOneDayBtn").style.display = clickedDay ? "inline-block" : "none";
     document.getElementById("modalBackdrop").style.display="flex";
   }
 
@@ -848,16 +865,39 @@ INDEX_HTML = r"""
     const today = new Date();
     currentYear = today.getFullYear();
     currentMonth = today.getMonth();
+    anchorDate = new Date(today);
 
-    document.getElementById("prevMonthBtn").addEventListener("click", ()=>{
-      currentMonth--;
-      if(currentMonth<0){ currentMonth=11; currentYear--; }
+    // ✅ 이전/다음: 월/주 모드에 따라 이동
+    document.getElementById("prevBtn").addEventListener("click", ()=>{
+      if(viewMode === "week"){
+        anchorDate.setDate(anchorDate.getDate()-7);
+      }else{
+        currentMonth--;
+        if(currentMonth<0){ currentMonth=11; currentYear--; }
+      }
       renderCalendar();
     });
 
-    document.getElementById("nextMonthBtn").addEventListener("click", ()=>{
-      currentMonth++;
-      if(currentMonth>11){ currentMonth=0; currentYear++; }
+    document.getElementById("nextBtn").addEventListener("click", ()=>{
+      if(viewMode === "week"){
+        anchorDate.setDate(anchorDate.getDate()+7);
+      }else{
+        currentMonth++;
+        if(currentMonth>11){ currentMonth=0; currentYear++; }
+      }
+      renderCalendar();
+    });
+
+    document.getElementById("monthViewBtn").addEventListener("click", ()=>{
+      viewMode = "month";
+      renderCalendar();
+    });
+
+    document.getElementById("weekViewBtn").addEventListener("click", ()=>{
+      viewMode = "week";
+      // 주별 전환 시 기준을 "현재 보고 있는 달의 1일"로 맞추고 싶으면 아래로 변경 가능:
+      // anchorDate = new Date(currentYear, currentMonth, 1);
+      anchorDate = new Date();
       renderCalendar();
     });
 
@@ -873,21 +913,9 @@ INDEX_HTML = r"""
     document.getElementById("cancelBtn").addEventListener("click", closeModal);
 
     document.getElementById("saveEventBtn").addEventListener("click", async ()=>{
-      let start = document.getElementById("startDate").value;
-      let end = document.getElementById("endDate").value || start;
-
-      if(!start){
-        alert("시작일을 입력해주세요.");
-        return;
-      }
-      // start > end이면 스왑
-      if(end && start > end){
-        const tmp = start; start = end; end = tmp;
-      }
-
       const payload = {
-        start: start,
-        end: end,
+        start: document.getElementById("startDate").value,
+        end: document.getElementById("endDate").value,
         business: document.getElementById("business").value || null,
         course: document.getElementById("course").value || null,
         time: document.getElementById("time").value || null,
@@ -896,6 +924,11 @@ INDEX_HTML = r"""
         admin: document.getElementById("admin").value || null,
         excluded_dates: document.getElementById("excludedDates").value || ""
       };
+
+      if(!payload.start || !payload.end){
+        alert("시작일과 종료일을 입력해주세요.");
+        return;
+      }
 
       if(mode==="create"){
         await createEvent(payload);
@@ -910,6 +943,16 @@ INDEX_HTML = r"""
       const id = parseInt(document.getElementById("eventId").value, 10);
       if(!id) return;
       deleteEvent(id);
+    });
+
+    // ✅ 이날 삭제(복구 없음)
+    document.getElementById("deleteOneDayBtn").addEventListener("click", async ()=>{
+      const id = parseInt(document.getElementById("eventId").value, 10);
+      const day = document.getElementById("clickedDay").value;
+      if(!id || !day) return;
+
+      await excludeOneDay(id, day);
+      closeModal();
     });
 
     fetchEvents();
