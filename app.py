@@ -539,6 +539,13 @@ INDEX_HTML = r"""
       .replaceAll("'","&#39;");
   }
 
+function lineIf(label, value){
+  const v = (value ?? "").toString().trim();
+  if(!v) return "";
+  return `<div class="event-line"><span class="event-dot">▪</span>${label}: ${escapeHtml(v)}</div>`;
+}
+
+
   function formatDate(d){
     const y = d.getFullYear();
     const m = String(d.getMonth()+1).padStart(2,"0");
@@ -689,29 +696,14 @@ INDEX_HTML = r"""
             // ✅ 날짜를 같이 넘겨서 '이날 삭제' 가능
             card.addEventListener("click", ()=>openEditModal(ev, iso));
 
-            const bizDiv = document.createElement("div");
-            bizDiv.className = "event-business";
-            bizDiv.textContent = ev.business || "사업명 없음";
-
-            const courseDiv = document.createElement("div");
-            courseDiv.className = "event-line";
-            courseDiv.innerHTML = `<span class="event-dot">▪</span>과정: ${escapeHtml(ev.course)}`;
-
-            const timeDiv = document.createElement("div");
-            timeDiv.className = "event-line";
-            timeDiv.innerHTML = `<span class="event-dot">▪</span>시간: ${escapeHtml(ev.time)}`;
-
-            const peopleDiv = document.createElement("div");
-            peopleDiv.className = "event-line";
-            peopleDiv.innerHTML = `<span class="event-dot">▪</span>인원: ${escapeHtml(ev.people)}`;
-
-            const placeDiv = document.createElement("div");
-            placeDiv.className = "event-line";
-            placeDiv.innerHTML = `<span class="event-dot">▪</span>장소: ${escapeHtml(ev.place)}`;
-
-            const adminDiv = document.createElement("div");
-            adminDiv.className = "event-line";
-            adminDiv.innerHTML = `<span class="event-dot">▪</span>행정: ${escapeHtml(ev.admin)}`;
+card.innerHTML = `
+  <div class="event-business">${escapeHtml(ev.business || "사업명 없음")}</div>
+  ${lineIf("과정", ev.course)}
+  ${lineIf("시간", ev.time)}
+  ${lineIf("인원", ev.people)}
+  ${lineIf("장소", ev.place)}
+  ${lineIf("행정", ev.admin)}
+`;
 
             card.appendChild(bizDiv);
             card.appendChild(courseDiv);
@@ -970,3 +962,4 @@ def index():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
