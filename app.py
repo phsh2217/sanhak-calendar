@@ -14,8 +14,7 @@ if not DATABASE_URL:
 # DB
 # =========================
 def get_db():
-    # Render Postgres는 보통 ssl 필요(Internal URL은 필요 없을 때도 있음). 필요 시 Render가 자동 처리하는 경우가 많음.
-    # 만약 연결 오류가 나면 아래처럼 sslmode=require 추가를 고려:
+    # 연결 오류가 나면 아래처럼 sslmode=require 추가를 고려:
     # return psycopg2.connect(DATABASE_URL, sslmode="require")
     return psycopg2.connect(DATABASE_URL)
 
@@ -66,7 +65,6 @@ def normalize_excluded(excluded_str: str) -> list[str]:
     if not excluded_str:
         return []
     items = [s.strip() for s in excluded_str.split(",") if s.strip()]
-    # 중복 제거 + 정렬(문자열 yyyy-mm-dd라 정렬 OK)
     return sorted(set(items))
 
 
@@ -306,7 +304,6 @@ INDEX_HTML = r"""
       font-size:11px;
       padding:3px 4px;
       border-radius:4px;
-      margin-bottom:0;
       border:1px solid rgba(0,0,0,0.08);
       word-wrap:break-word;
       cursor:pointer;
@@ -373,7 +370,6 @@ INDEX_HTML = r"""
       .top-bar,.modal-backdrop{display:none !important;}
       .container{margin:0;max-width:100%;padding:0;}
       body{background:#fff;}
-      /* ✅ 인쇄 색상 유지(브라우저 설정에 따라 제한될 수 있음) */
       *{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }
     }
   </style>
@@ -539,12 +535,12 @@ INDEX_HTML = r"""
       .replaceAll("'","&#39;");
   }
 
-function lineIf(label, value){
-  const v = (value ?? "").toString().trim();
-  if(!v) return "";
-  return `<div class="event-line"><span class="event-dot">▪</span>${label}: ${escapeHtml(v)}</div>`;
-}
-
+  // ✅ 값이 비면 라벨 자체를 출력하지 않음
+  function lineIf(label, value){
+    const v = (value ?? "").toString().trim();
+    if(!v) return "";
+    return `<div class="event-line"><span class="event-dot">▪</span>${label}: ${escapeHtml(v)}</div>`;
+  }
 
   function formatDate(d){
     const y = d.getFullYear();
@@ -586,6 +582,18 @@ function lineIf(label, value){
 
   function getBusinessClass(biz){
     return businessColors[biz] || "biz-기타";
+  }
+
+  function buildCardHTML(ev){
+    // business는 항상 보여주고(없으면 "사업명 없음"), 나머지는 빈 값이면 미표시
+    return `
+      <div class="event-business">${escapeHtml(ev.business || "사업명 없음")}</div>
+      ${lineIf("과정", ev.course)}
+      ${lineIf("시간", ev.time)}
+      ${lineIf("인원", ev.people)}
+      ${lineIf("장소", ev.place)}
+      ${lineIf("행정", ev.admin)}
+    `;
   }
 
   async function fetchEvents(){
@@ -648,7 +656,7 @@ function lineIf(label, value){
     }
   }
 
-  // ✅ 월별 렌더링(기존 달력)
+  // ✅ 월별 렌더링
   function renderMonth(){
     const body = document.getElementById("calendarBody");
     body.innerHTML = "";
@@ -693,24 +701,8 @@ function lineIf(label, value){
 
             const card = document.createElement("div");
             card.className = "event-card " + getBusinessClass(ev.business || "");
-            // ✅ 날짜를 같이 넘겨서 '이날 삭제' 가능
             card.addEventListener("click", ()=>openEditModal(ev, iso));
-
-card.innerHTML = `
-  <div class="event-business">${escapeHtml(ev.business || "사업명 없음")}</div>
-  ${lineIf("과정", ev.course)}
-  ${lineIf("시간", ev.time)}
-  ${lineIf("인원", ev.people)}
-  ${lineIf("장소", ev.place)}
-  ${lineIf("행정", ev.admin)}
-`;
-
-            card.appendChild(bizDiv);
-            card.appendChild(courseDiv);
-            card.appendChild(timeDiv);
-            card.appendChild(peopleDiv);
-            card.appendChild(placeDiv);
-            card.appendChild(adminDiv);
+            card.innerHTML = buildCardHTML(ev);
 
             eventsDiv.appendChild(card);
           });
@@ -726,7 +718,7 @@ card.innerHTML = `
     }
   }
 
-  // ✅ 주별 렌더링(1주 7칸만)
+  // ✅ 주별 렌더링(1주 7칸)
   function renderWeek(){
     const body = document.getElementById("calendarBody");
     body.innerHTML = "";
@@ -738,7 +730,6 @@ card.innerHTML = `
       `${ws.getFullYear()}년 ${ws.getMonth()+1}월 (주별: ${formatDate(ws)} ~ ${formatDate(we)})`;
 
     const businessFilter = document.getElementById("businessFilter").value;
-
     const tr = document.createElement("tr");
 
     for(let dow=0; dow<7; dow++){
@@ -767,37 +758,7 @@ card.innerHTML = `
         const card = document.createElement("div");
         card.className = "event-card " + getBusinessClass(ev.business || "");
         card.addEventListener("click", ()=>openEditModal(ev, iso));
-
-        const bizDiv = document.createElement("div");
-        bizDiv.className = "event-business";
-        bizDiv.textContent = ev.business || "사업명 없음";
-
-        const courseDiv = document.createElement("div");
-        courseDiv.className = "event-line";
-        courseDiv.innerHTML = `<span class="event-dot">▪</span>과정: ${escapeHtml(ev.course)}`;
-
-        const timeDiv = document.createElement("div");
-        timeDiv.className = "event-line";
-        timeDiv.innerHTML = `<span class="event-dot">▪</span>시간: ${escapeHtml(ev.time)}`;
-
-        const peopleDiv = document.createElement("div");
-        peopleDiv.className = "event-line";
-        peopleDiv.innerHTML = `<span class="event-dot">▪</span>인원: ${escapeHtml(ev.people)}`;
-
-        const placeDiv = document.createElement("div");
-        placeDiv.className = "event-line";
-        placeDiv.innerHTML = `<span class="event-dot">▪</span>장소: ${escapeHtml(ev.place)}`;
-
-        const adminDiv = document.createElement("div");
-        adminDiv.className = "event-line";
-        adminDiv.innerHTML = `<span class="event-dot">▪</span>행정: ${escapeHtml(ev.admin)}`;
-
-        card.appendChild(bizDiv);
-        card.appendChild(courseDiv);
-        card.appendChild(timeDiv);
-        card.appendChild(peopleDiv);
-        card.appendChild(placeDiv);
-        card.appendChild(adminDiv);
+        card.innerHTML = buildCardHTML(ev);
 
         eventsDiv.appendChild(card);
       });
@@ -812,7 +773,7 @@ card.innerHTML = `
     mode="create";
     document.getElementById("modalTitle").textContent="일정 추가";
     document.getElementById("eventId").value="";
-    document.getElementById("clickedDay").value=""; // 생성은 날짜 클릭 개념 없음
+    document.getElementById("clickedDay").value="";
     document.getElementById("startDate").value=dateStr||"";
     document.getElementById("endDate").value=dateStr||"";
     document.getElementById("business").value="";
@@ -827,7 +788,6 @@ card.innerHTML = `
     document.getElementById("modalBackdrop").style.display="flex";
   }
 
-  // ✅ 클릭한 날짜(clickedDay)를 받아서 '이날 삭제' 가능하게
   function openEditModal(ev, clickedDay){
     mode="edit";
     document.getElementById("modalTitle").textContent="일정 수정";
@@ -859,7 +819,6 @@ card.innerHTML = `
     currentMonth = today.getMonth();
     anchorDate = new Date(today);
 
-    // ✅ 이전/다음: 월/주 모드에 따라 이동
     document.getElementById("prevBtn").addEventListener("click", ()=>{
       if(viewMode === "week"){
         anchorDate.setDate(anchorDate.getDate()-7);
@@ -887,7 +846,7 @@ card.innerHTML = `
 
     document.getElementById("weekViewBtn").addEventListener("click", ()=>{
       viewMode = "week";
-      // 주별 전환 시 기준을 "현재 보고 있는 달의 1일"로 맞추고 싶으면 아래로 변경 가능:
+      // 원하면 "현재 보고 있던 달의 1일"로 고정도 가능:
       // anchorDate = new Date(currentYear, currentMonth, 1);
       anchorDate = new Date();
       renderCalendar();
@@ -962,4 +921,3 @@ def index():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
-
