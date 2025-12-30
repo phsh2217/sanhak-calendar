@@ -409,7 +409,7 @@ INDEX_HTML = r"""
     @media (max-width: 768px){
       h1{font-size:22px;}
       .current-month{font-size:17px;}
-      .calendar tbody td{height:145px;}
+      .calendar tbody td{height:auto;min-height:140px;}
       .event-card{font-size:12px;}
       .events{grid-template-columns:1fr;}
     }
@@ -420,6 +420,38 @@ INDEX_HTML = r"""
       body{background:#fff;}
       *{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }
     }
+
+@media (max-width: 768px){
+  .event-line{
+    display: -webkit-box;
+    -webkit-line-clamp: 2;      /* 2줄까지만 */
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+}
+
+@media (max-width: 768px){
+  .events{ gap: 6px; }
+  .event-card{
+    padding: 6px 8px;
+    border-radius: 8px;
+    font-size: 12px;
+  }
+  .event-business{
+    font-size: 13px;
+    margin-bottom: 4px;
+  }
+}
+
+@media (max-width: 768px){
+  .top-bar{flex-direction:column; align-items:stretch;}
+  .top-left{justify-content:flex-start;}
+  .top-right{justify-content:flex-end;}
+  #addEventBtn{width:100%;}
+}
+
+
+    
   </style>
 </head>
 <body>
@@ -975,3 +1007,4 @@ def index():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
