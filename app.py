@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timedelta
 import psycopg2
 import psycopg2.extras
 from flask import Flask, request, jsonify
@@ -14,7 +15,7 @@ if not DATABASE_URL:
 # DB
 # =========================
 def get_db():
-    # 연결 오류가 나면 아래처럼 sslmode=require 추가를 고려:
+    # 연결 오류가 나면 아래처럼 sslmode=require 추가 고려:
     # return psycopg2.connect(DATABASE_URL, sslmode="require")
     return psycopg2.connect(DATABASE_URL)
 
@@ -72,6 +73,19 @@ def excluded_to_str(excluded_list: list[str]) -> str:
     return ",".join(excluded_list)
 
 
+def parse_ymd(s: str) -> datetime:
+    return datetime.strptime(s, "%Y-%m-%d")
+
+
+def daterange(start_s: str, end_s: str):
+    """yield YYYY-MM-DD for each day from start to end inclusive"""
+    cur = parse_ymd(start_s)
+    end = parse_ymd(end_s)
+    while cur <= end:
+        yield cur.strftime("%Y-%m-%d")
+        cur += timedelta(days=1)
+
+
 # =========================
 # API
 # =========================
@@ -94,37 +108,73 @@ def api_get_events():
 
 @app.route("/api/events", methods=["POST"])
 def api_create_event():
+    """
+    ✅ 기간 입력을 DB에 '날짜별 개별 일정'으로 저장
+    - start == end : 1건 생성
+    - start <  end : 기간을 날짜별로 쪼개서 N건 생성 (각 건은 start=end=해당 날짜)
+    응답:
+      - 1건 생성이면 객체 1개
+      - N건 생성이면 배열 N개
+    """
     data = request.json or {}
+
+    start = (data.get("start") or "").strip()
+    end = (data.get("end") or "").strip()
+    if not start or not end:
+        return jsonify({"error": "start and end are required"}), 400
+
+    business = data.get("business")
+    course = data.get("course")
+    time_ = data.get("time")
+    people = data.get("people")
+    place = data.get("place")
+    admin = data.get("admin")
+
+    # 새로 생성되는 날짜별 일정은 excluded_dates 사용하지 않음(호환 위해 컬럼은 유지)
+    excluded_dates = ""
+
+    # 날짜 검증
+    try:
+        sdt = parse_ymd(start)
+        edt = parse_ymd(end)
+    except Exception:
+        return jsonify({"error": "date format must be YYYY-MM-DD"}), 400
+
+    if edt < sdt:
+        return jsonify({"error": "end must be >= start"}), 400
 
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute(
-        """
-        INSERT INTO events (start, "end", business, course, time, people, place, admin, excluded_dates)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        RETURNING id, start, "end", business, course, time, people, place, admin, excluded_dates;
-        """,
-        (
-            data.get("start"),
-            data.get("end"),
-            data.get("business"),
-            data.get("course"),
-            data.get("time"),
-            data.get("people"),
-            data.get("place"),
-            data.get("admin"),
-            data.get("excluded_dates") or "",
-        ),
-    )
-    row = cur.fetchone()
+
+    created = []
+
+    # 기간이면 날짜별로 분할 저장
+    for d in daterange(start, end):
+        cur.execute(
+            """
+            INSERT INTO events (start, "end", business, course, time, people, place, admin, excluded_dates)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id, start, "end", business, course, time, people, place, admin, excluded_dates;
+            """,
+            (d, d, business, course, time_, people, place, admin, excluded_dates),
+        )
+        created.append(row_to_event(cur.fetchone()))
+
     conn.commit()
     cur.close()
     conn.close()
-    return jsonify(row_to_event(row)), 201
+
+    if len(created) == 1:
+        return jsonify(created[0]), 201
+    return jsonify(created), 201
 
 
 @app.route("/api/events/<int:event_id>", methods=["PUT"])
 def api_update_event(event_id):
+    """
+    ✅ 이제 대부분 '하루짜리(start=end)' 일정이므로,
+    하루만 수정하는 목적에 잘 맞음.
+    """
     data = request.json or {}
 
     conn = get_db()
@@ -145,8 +195,8 @@ def api_update_event(event_id):
         RETURNING id, start, "end", business, course, time, people, place, admin, excluded_dates;
         """,
         (
-            data.get("start"),
-            data.get("end"),
+            (data.get("start") or "").strip(),
+            (data.get("end") or "").strip(),
             data.get("business"),
             data.get("course"),
             data.get("time"),
@@ -181,7 +231,7 @@ def api_delete_event(event_id):
     return jsonify({"status": "deleted"})
 
 
-# ✅ "이날 삭제"용: excluded_dates에 특정 날짜 추가
+# (호환 유지) 예전 '기간 1건' 이벤트가 남아 있을 수 있으니 exclude는 유지
 @app.route("/api/events/<int:event_id>/exclude", methods=["POST"])
 def api_exclude_one_day(event_id):
     data = request.json or {}
@@ -313,11 +363,11 @@ INDEX_HTML = r"""
     .event-business{
       font-weight:600;
       margin-bottom:2px;
-      text-align:center; /* 사업명 가운데 정렬 */
+      text-align:center;
     }
 
     .event-line{
-      white-space:normal; /* ✅ 2열에서 줄바꿈 허용 */
+      white-space:normal;
       line-height:1.15;
     }
 
@@ -347,8 +397,7 @@ INDEX_HTML = r"""
     .modal-close{cursor:pointer;border:none;background:none;font-size:20px;line-height:1;}
     .field{margin-bottom:6px;}
     .field label{display:block;font-size:13px;margin-bottom:2px;}
-    .field input,.field select,.field textarea{width:100%;padding:4px 6px;font-size:13px;}
-    textarea{resize:vertical;}
+    .field input,.field select{width:100%;padding:4px 6px;font-size:13px;}
     .field-inline{display:flex;gap:6px;}
     .field-inline .field{flex:1;margin-bottom:0;}
     .modal-footer{display:flex;justify-content:space-between;gap:4px;margin-top:8px;flex-wrap:wrap;}
@@ -357,7 +406,6 @@ INDEX_HTML = r"""
     .mini-btn{padding:6px 10px;border-radius:4px;border:1px solid #ccc;background:#f7f7f7;cursor:pointer;}
     .mini-danger{background:#ff4d4f;border-color:#d9363e;color:#fff;}
 
-    /* 모바일: 1열로 */
     @media (max-width: 768px){
       h1{font-size:22px;}
       .current-month{font-size:17px;}
@@ -423,7 +471,6 @@ INDEX_HTML = r"""
   </table>
 </div>
 
-<!-- 모달 -->
 <div class="modal-backdrop" id="modalBackdrop">
   <div class="modal">
     <div class="modal-header">
@@ -487,16 +534,20 @@ INDEX_HTML = r"""
         </div>
       </div>
 
-      <div class="field">
-        <label for="excludedDates">제외일자 (쉼표로 구분, 예: 2025-11-27)</label>
-        <input type="text" id="excludedDates" placeholder="없으면 비워두기">
+      <div class="field" style="display:none;">
+        <label for="excludedDates">제외일자</label>
+        <input type="text" id="excludedDates">
+      </div>
+
+      <div style="font-size:12px;color:#666;margin-top:6px;">
+        ※ 기간으로 입력해도 저장 후에는 <b>날짜별 개별 일정</b>으로 분할됩니다.
       </div>
     </div>
 
     <div class="modal-footer">
-      <button class="btn-danger" id="deleteEventBtn" style="display:none;">전체 삭제</button>
+      <button class="btn-danger" id="deleteEventBtn" style="display:none;">삭제</button>
 
-      <!-- ✅ 이벤트(해당 날짜) 클릭으로 들어온 경우에만 표시 -->
+      <!-- (호환) 예전 기간형 이벤트만 이날삭제(exclude) 필요하지만, 일단 유지 -->
       <button class="mini-btn mini-danger" id="deleteOneDayBtn" style="display:none;">이날 삭제</button>
 
       <div style="flex:1;"></div>
@@ -511,9 +562,8 @@ INDEX_HTML = r"""
   let currentYear, currentMonth;
   let mode = "create";
 
-  // ✅ 월/주 보기
   let viewMode = "month"; // "month" | "week"
-  let anchorDate = new Date(); // 주별 보기 기준
+  let anchorDate = new Date();
 
   const businessColors = {
     "대관":"biz-대관",
@@ -535,7 +585,6 @@ INDEX_HTML = r"""
       .replaceAll("'","&#39;");
   }
 
-  // ✅ 값이 비면 라벨 자체를 출력하지 않음
   function lineIf(label, value){
     const v = (value ?? "").toString().trim();
     if(!v) return "";
@@ -556,10 +605,11 @@ INDEX_HTML = r"""
   function startOfWeek(d){
     const x = new Date(d);
     x.setHours(0,0,0,0);
-    x.setDate(x.getDate() - x.getDay()); // 일요일 시작
+    x.setDate(x.getDate() - x.getDay());
     return x;
   }
 
+  // 예전 기간형 이벤트 호환을 위한 함수 (현재는 대부분 start=end)
   function getRangeDates(startStr, endStr, excludedStr){
     const dates = [];
     if(!startStr || !endStr) return dates;
@@ -585,7 +635,6 @@ INDEX_HTML = r"""
   }
 
   function buildCardHTML(ev){
-    // business는 항상 보여주고(없으면 "사업명 없음"), 나머지는 빈 값이면 미표시
     return `
       <div class="event-business">${escapeHtml(ev.business || "사업명 없음")}</div>
       ${lineIf("과정", ev.course)}
@@ -603,6 +652,7 @@ INDEX_HTML = r"""
     renderCalendar();
   }
 
+  // ✅ 서버가 기간을 자동 분할해서 (객체 또는 배열)로 응답할 수 있음
   async function createEvent(payload){
     const res = await fetch("/api/events",{
       method:"POST",
@@ -610,8 +660,13 @@ INDEX_HTML = r"""
       body:JSON.stringify(payload)
     });
     if(!res.ok){ alert("저장 실패"); return; }
-    const ev = await res.json();
-    allEvents.push(ev);
+
+    const created = await res.json();
+    if(Array.isArray(created)){
+      allEvents.push(...created);
+    }else{
+      allEvents.push(created);
+    }
     renderCalendar();
   }
 
@@ -656,7 +711,6 @@ INDEX_HTML = r"""
     }
   }
 
-  // ✅ 월별 렌더링
   function renderMonth(){
     const body = document.getElementById("calendarBody");
     body.innerHTML = "";
@@ -703,7 +757,6 @@ INDEX_HTML = r"""
             card.className = "event-card " + getBusinessClass(ev.business || "");
             card.addEventListener("click", ()=>openEditModal(ev, iso));
             card.innerHTML = buildCardHTML(ev);
-
             eventsDiv.appendChild(card);
           });
         }
@@ -718,7 +771,6 @@ INDEX_HTML = r"""
     }
   }
 
-  // ✅ 주별 렌더링(1주 7칸)
   function renderWeek(){
     const body = document.getElementById("calendarBody");
     body.innerHTML = "";
@@ -759,7 +811,6 @@ INDEX_HTML = r"""
         card.className = "event-card " + getBusinessClass(ev.business || "");
         card.addEventListener("click", ()=>openEditModal(ev, iso));
         card.innerHTML = buildCardHTML(ev);
-
         eventsDiv.appendChild(card);
       });
 
@@ -805,7 +856,12 @@ INDEX_HTML = r"""
     document.getElementById("excludedDates").value=ev.excluded_dates||"";
 
     document.getElementById("deleteEventBtn").style.display="inline-block";
-    document.getElementById("deleteOneDayBtn").style.display = clickedDay ? "inline-block" : "none";
+
+    // ✅ 이제 대부분 날짜별 일정이므로 이날 삭제(exclude)는 사실상 필요 없음.
+    // 다만 과거 '기간 1건' 이벤트가 남아있을 수 있어서, start!=end일 때만 표시.
+    document.getElementById("deleteOneDayBtn").style.display =
+      (clickedDay && ev.start !== ev.end) ? "inline-block" : "none";
+
     document.getElementById("modalBackdrop").style.display="flex";
   }
 
@@ -846,8 +902,6 @@ INDEX_HTML = r"""
 
     document.getElementById("weekViewBtn").addEventListener("click", ()=>{
       viewMode = "week";
-      // 원하면 "현재 보고 있던 달의 1일"로 고정도 가능:
-      // anchorDate = new Date(currentYear, currentMonth, 1);
       anchorDate = new Date();
       renderCalendar();
     });
@@ -873,7 +927,7 @@ INDEX_HTML = r"""
         people: document.getElementById("people").value || null,
         place: document.getElementById("place").value || null,
         admin: document.getElementById("admin").value || null,
-        excluded_dates: document.getElementById("excludedDates").value || ""
+        excluded_dates: "" // 신규 저장은 분할이므로 사용 안 함
       };
 
       if(!payload.start || !payload.end){
@@ -882,7 +936,7 @@ INDEX_HTML = r"""
       }
 
       if(mode==="create"){
-        await createEvent(payload);
+        await createEvent(payload); // ✅ 서버가 자동 분할 저장
       }else{
         const id = parseInt(document.getElementById("eventId").value, 10);
         await updateEvent(id, payload);
@@ -896,7 +950,7 @@ INDEX_HTML = r"""
       deleteEvent(id);
     });
 
-    // ✅ 이날 삭제(복구 없음)
+    // (호환) 과거 기간형 이벤트일 때만 의미 있음
     document.getElementById("deleteOneDayBtn").addEventListener("click", async ()=>{
       const id = parseInt(document.getElementById("eventId").value, 10);
       const day = document.getElementById("clickedDay").value;
