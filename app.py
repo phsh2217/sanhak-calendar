@@ -450,6 +450,56 @@ INDEX_HTML = r"""
   #addEventBtn{width:100%;}
 }
 
+@media (max-width: 768px) {
+  .event-card {
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+}
+
+@media (max-width: 768px) {
+  .event-card,
+  .event-card * {
+    writing-mode: horizontal-tb !important;
+    word-break: keep-all;
+    white-space: normal;
+  }
+}
+
+@media (max-width: 768px) {
+  .event-title {
+    font-size: 13px;
+    font-weight: 700;
+    margin-bottom: 4px;
+  }
+
+  .event-line {
+    font-size: 12px;
+    line-height: 1.4;
+  }
+}
+
+@media (max-width: 768px) {
+  .calendar td {
+    padding: 4px;
+    vertical-align: top;
+  }
+
+  .event-card {
+    margin-bottom: 6px;
+    border-radius: 10px;
+  }
+}
+
+
+@media (max-width: 768px) {
+  .event-card { width:100%; max-width:100%; }
+  .event-card * { writing-mode: horizontal-tb !important; }
+}
+
+
+
 
     
   </style>
@@ -1007,4 +1057,5 @@ def index():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
 
