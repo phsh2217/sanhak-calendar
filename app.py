@@ -8,6 +8,19 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from flask import Flask, request, jsonify, Response
 
+from flask import jsonify
+import traceback
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    app.logger.exception(e)  # Render 로그에 Traceback 남김
+    return jsonify({
+        "ok": False,
+        "error": str(e),
+        "type": e.__class__.__name__,
+    }), 500
+
+
 app = Flask(__name__)
 
 # -----------------------------
@@ -1158,4 +1171,5 @@ def index():
 if __name__ == "__main__":
     # 로컬에서는 FLASK_RUN_HOST 같은 환경변수로 바꿔도 됨
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
