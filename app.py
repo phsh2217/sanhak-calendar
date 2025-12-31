@@ -698,7 +698,7 @@ def _html() -> str:
   function hashColor(str) {{
     // 등록된 새 사업명도 안정적으로 같은 파스텔색 나오게
     const h = [...str].reduce((a,c)=>a + c.charCodeAt(0), 0) % 360;
-    return `hsl(${h} 70% 88%)`;
+return "hsl(" + h + " 70% 88%)";
   }}
 
   function getBg(biz) {{
@@ -1158,3 +1158,4 @@ def index():
 if __name__ == "__main__":
     # 로컬에서는 FLASK_RUN_HOST 같은 환경변수로 바꿔도 됨
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
