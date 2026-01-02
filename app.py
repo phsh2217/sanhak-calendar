@@ -524,13 +524,27 @@ HTML_PAGE = r"""<!doctype html>
   // -------------------------
   const pad2 = (n) => String(n).padStart(2, "0");
   const fmtDate = (d) => `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
-  const parseDate = (s) => {
-    if(!s || !/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) return null;
-    const [y,m,da] = s.split("-").map(Number);
-    const d = new Date(y, m-1, da);
-    if(d.getFullYear()!==y || d.getMonth()!==m-1 || d.getDate()!==da) return null;
-    return d;
-  };
+const parseDate = (s) => {
+  if(!s) return null;
+
+  // 1) 공백 제거
+  s = String(s).trim();
+
+  // 2) 유니코드 하이픈류를 ASCII '-'로 통일
+  s = s.replace(/[‐-‒–—―−]/g, "-");
+
+  // 3) 혹시 '2026.01.09' 같은 입력도 들어오면 '-'로 통일 (안 쓰면 빼도 됨)
+  s = s.replace(/[./]/g, "-");
+
+  // 4) 최종 형식 체크
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+
+  const [y,m,da] = s.split("-").map(Number);
+  const d = new Date(y, m-1, da);
+  if(d.getFullYear()!==y || d.getMonth()!==m-1 || d.getDate()!==da) return null;
+  return d;
+};
+
   const yyyymm = (d) => `${d.getFullYear()}-${pad2(d.getMonth()+1)}`;
   const startOfWeek = (d) => {
     const x = new Date(d);
@@ -991,3 +1005,4 @@ HTML_PAGE = r"""<!doctype html>
 @app.route("/", methods=["GET"])
 def index():
     return Response(HTML_PAGE, mimetype="text/html")
+
