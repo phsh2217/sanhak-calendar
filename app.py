@@ -1,334 +1,265 @@
 import os
-import re
-from datetime import date, timedelta
-from flask import Flask, request, jsonify, Response
+import json
+import uuid
+from datetime import datetime, date, timedelta
+from typing import Optional, List, Dict, Any
+
 import psycopg2
 import psycopg2.extras
+from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL 환경변수가 설정되어 있지 않습니다.")
+    raise RuntimeError("Error: DATABASE_URL 환경변수가 설정되어 있지 않습니다.")
 
-# ----------------------------
-# DB helpers
-# ----------------------------
+
+# ---------------------------
+# DB Helpers
+# ---------------------------
 def get_db():
-    # Render Postgres는 보통 SSL 필요
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    # Render Postgres URL 그대로 사용
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    return conn
 
-def col_exists(cur, table: str, col: str) -> bool:
-    cur.execute(
-        """
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name=%s AND column_name=%s
-        """,
-        (table, col),
-    )
-    return cur.fetchone() is not None
 
-def try_drop_not_null(cur, table: str, col: str):
-    # 기존 혼합 스키마에서 start/end NOT NULL 때문에 insert 실패하는 케이스 방어
-    try:
-        cur.execute(f'ALTER TABLE "{table}" ALTER COLUMN "{col}" DROP NOT NULL;')
-    except Exception:
-        # 권한/상태/이미 nullable 등 어떤 이유든 실패해도 서비스는 계속 동작해야 함
-        cur.connection.rollback()
-        cur = cur.connection.cursor()
-    return cur
+def parse_ymd(s: str) -> date:
+    return datetime.strptime(s, "%Y-%m-%d").date()
 
-# 전역: 현재 테이블에 어떤 컬럼이 있는지 캐시
-DB_COLS = set()
+
+def date_range(d1: date, d2: date):
+    cur = d1
+    step = timedelta(days=1)
+    while cur <= d2:
+        yield cur
+        cur += step
+
+
+def split_excluded(excluded: Optional[str]) -> List[str]:
+    if not excluded:
+        return []
+    if isinstance(excluded, list):
+        # 프론트에서 리스트로 보내는 경우
+        return sorted(set([str(x).strip() for x in excluded if str(x).strip()]))
+    # 문자열(콤마)로 오는 경우
+    items = [x.strip() for x in str(excluded).split(",") if x.strip()]
+    return sorted(set(items))
+
+
+def safe_str(v) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
+
 
 def init_db():
     """
-    Render 무료 플랜에서 Shell 없이도 자동으로 스키마 생성/보강 + 구스키마(start/end) 혼합 대응
+    최종 스키마: events 테이블은 '날짜 1건 = row 1개'
+    event_date DATE NOT NULL
     """
-    global DB_COLS
 
     conn = get_db()
-    try:
-        cur = conn.cursor()
+    cur = conn.cursor()
 
-        # 1) 기본 테이블 생성 (없으면)
+    # 1) 최종 테이블 생성
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS events (
+            id SERIAL PRIMARY KEY,
+            event_date DATE NOT NULL,
+            business TEXT,
+            course TEXT,
+            time TEXT,
+            people TEXT,
+            place TEXT,
+            admin TEXT,
+            group_id UUID,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_event_date ON events(event_date);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_group_id ON events(group_id);")
+
+    # 2) 구버전 테이블( start / end )가 남아있으면 가능한 범위에서 마이그레이션
+    #    - events 테이블에 'start' 컬럼이 존재하는지 확인
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name='events'
+        """
+    )
+    cols = {r["column_name"] for r in cur.fetchall()}
+
+    # 구버전 컬럼이 섞여있는 상태(예: start, end, excluded_dates)가면 마이그레이션 시도
+    # (이미 최종 events를 만들었으니, 구버전이 '별도 테이블'로 존재하는 경우만 안전하게 처리 가능)
+    # → 사용자가 과거 코드로 만든 테이블명이 동일(events)이라면,
+    #    이미 여기서 CREATE TABLE이 실행되며 충돌은 없고 컬럼이 섞인 상태가 될 수 있음.
+    #    그 경우엔 '구버전 컬럼'들을 읽어 새 테이블로 옮긴 뒤 재구성한다.
+    if "start" in cols or "excluded_dates" in cols or "end" in cols or '"end"' in cols:
+        # events_v2 만들어서 옮긴 뒤 교체
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS events (
+            CREATE TABLE IF NOT EXISTS events_v2 (
                 id SERIAL PRIMARY KEY,
-                event_date DATE,
+                event_date DATE NOT NULL,
                 business TEXT,
                 course TEXT,
                 time TEXT,
                 people TEXT,
                 place TEXT,
-                admin TEXT
+                admin TEXT,
+                group_id UUID,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
             );
             """
         )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_v2_event_date ON events_v2(event_date);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_v2_group_id ON events_v2(group_id);")
 
-        # 2) 컬럼 보강(혹시 과거 테이블이 start/end 중심이었다면 추가)
-        # event_date 없으면 추가
-        if not col_exists(cur, "events", "event_date"):
-            cur.execute('ALTER TABLE "events" ADD COLUMN event_date DATE;')
+        # 구버전 데이터 읽기 (가능한 케이스만)
+        # end 컬럼은 과거에 "end"로 만들었을 수 있어서 둘 다 시도
+        # start/end가 없으면(이미 v2 구조) 마이그레이션 skip
+        if "start" in cols and ("end" in cols or "end" in cols or '"end"' in cols):
+            try:
+                # end가 예약어라 "end"로 저장된 경우를 우선 시도
+                cur.execute(
+                    """
+                    SELECT id, start, "end" AS end, business, course, time, people, place, admin, excluded_dates
+                    FROM events
+                    """
+                )
+            except Exception:
+                conn.rollback()
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT id, start, end AS end, business, course, time, people, place, admin, excluded_dates
+                    FROM events
+                    """
+                )
 
-        # 필드들 보강
-        for c in ["business", "course", "time", "people", "place", "admin"]:
-            if not col_exists(cur, "events", c):
-                cur.execute(f'ALTER TABLE "events" ADD COLUMN "{c}" TEXT;')
+            rows = cur.fetchall()
+            for r in rows:
+                try:
+                    s = parse_ymd(r["start"])
+                    e = parse_ymd(r["end"])
+                except Exception:
+                    continue
 
-        # 3) 구 컬럼 start/end가 있으면: (a) 가능하면 nullable로 변경 (b) event_date로 채우기
-        has_start = col_exists(cur, "events", "start")
-        has_end = col_exists(cur, "events", "end")
+                excluded_list = split_excluded(r.get("excluded_dates"))
+                g = uuid.uuid4()
 
-        if has_start:
-            cur = try_drop_not_null(cur, "events", "start")
-        if has_end:
-            cur = try_drop_not_null(cur, "events", "end")
+                for d in date_range(s, e):
+                    ds = d.strftime("%Y-%m-%d")
+                    if ds in excluded_list:
+                        continue
+                    cur.execute(
+                        """
+                        INSERT INTO events_v2(event_date, business, course, time, people, place, admin, group_id)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        (
+                            d,
+                            r.get("business"),
+                            r.get("course"),
+                            r.get("time"),
+                            r.get("people"),
+                            r.get("place"),
+                            r.get("admin"),
+                            g,
+                        ),
+                    )
 
-        # 4) 구 데이터 -> event_date 채우기 (start가 'YYYY-MM-DD'이면)
-        if has_start:
-            cur.execute(
-                """
-                UPDATE events
-                SET event_date = CASE
-                    WHEN event_date IS NULL
-                     AND start ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-                    THEN start::date
-                    ELSE event_date
-                END
-                """
-            )
+            # 교체: 기존 events 백업 후 v2를 events로
+            # (권한/락 문제시 실패 가능 → 그땐 그냥 v2만 남아도 서비스는 살아야 하므로 try)
+            try:
+                cur.execute("ALTER TABLE events RENAME TO events_old;")
+                cur.execute("ALTER TABLE events_v2 RENAME TO events;")
+                cur.execute("DROP TABLE IF EXISTS events_old;")
+            except Exception:
+                conn.rollback()
 
-        # 5) 반대로 event_date는 있는데 start/end가 존재하면 start/end도 채워두기
-        if has_start:
-            cur.execute(
-                """
-                UPDATE events
-                SET start = CASE
-                    WHEN (start IS NULL OR start='')
-                     AND event_date IS NOT NULL
-                    THEN to_char(event_date, 'YYYY-MM-DD')
-                    ELSE start
-                END
-                """
-            )
-        if has_end:
-            cur.execute(
-                """
-                UPDATE events
-                SET end = CASE
-                    WHEN (end IS NULL OR end='')
-                     AND event_date IS NOT NULL
-                    THEN to_char(event_date, 'YYYY-MM-DD')
-                    ELSE end
-                END
-                """
-            )
+    conn.commit()
+    conn.close()
 
-        # 6) 인덱스
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_date ON events(event_date);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_events_business ON events(business);")
-
-        conn.commit()
-
-        # 컬럼 캐시 갱신
-        cur2 = conn.cursor()
-        cur2.execute(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema='public' AND table_name='events'
-            """
-        )
-        DB_COLS = {r[0] for r in cur2.fetchall()}
-
-    finally:
-        conn.close()
 
 init_db()
 
-# ----------------------------
-# Utils
-# ----------------------------
-def parse_yyyy_mm_dd(s: str) -> date:
-    if not s or not isinstance(s, str):
-        raise ValueError("date string is empty")
-    s = s.strip()
-    # 다양한 하이픈/점/슬래시 입력을 '-'로 통일
-    s = re.sub(r"[‐-‒–—―−]", "-", s)
-    s = re.sub(r"[./]", "-", s)
-    if not re.match(r"^\d{4}-\d{2}-\d{2}$", s):
-        raise ValueError("date format must be YYYY-MM-DD")
-    y, m, d = map(int, s.split("-"))
-    return date(y, m, d)
 
-def daterange_inclusive(d1: date, d2: date):
-    if d2 < d1:
-        d1, d2 = d2, d1
-    cur = d1
-    while cur <= d2:
-        yield cur
-        cur += timedelta(days=1)
-
-def clean_str(x):
-    if x is None:
-        return None
-    if not isinstance(x, str):
-        x = str(x)
-    x = x.strip()
-    return x if x != "" else None
-
-def row_to_dict(r):
-    # event_date가 없거나 NULL이고 start가 있을 수도 있으니 안전하게 처리
-    ev = r.get("event_date")
-    if not ev and "start" in r and r.get("start"):
-        try:
-            ev = parse_yyyy_mm_dd(r.get("start"))
-        except Exception:
-            ev = None
-
-    return {
-        "id": r["id"],
-        "event_date": ev.isoformat() if ev else None,
-        "business": r.get("business"),
-        "course": r.get("course"),
-        "time": r.get("time"),
-        "people": r.get("people"),
-        "place": r.get("place"),
-        "admin": r.get("admin"),
-    }
-
-def insert_event(cur, d: date, business, course, time_, people, place, admin):
-    """
-    혼합 스키마(start/end NOT NULL 포함)에서도 실패하지 않도록
-    존재하는 컬럼만 골라 INSERT
-    """
-    cols = ["event_date", "business", "course", "time", "people", "place", "admin"]
-    vals = [d, business, course, time_, people, place, admin]
-
-    # start/end 컬럼이 존재하면 같이 넣어준다(특히 NOT NULL 방어)
-    if "start" in DB_COLS:
-        cols.append("start")
-        vals.append(d.isoformat())
-    if "end" in DB_COLS:
-        cols.append("end")
-        vals.append(d.isoformat())
-
-    col_sql = ", ".join([f'"{c}"' for c in cols])
-    ph_sql = ", ".join(["%s"] * len(cols))
-
-    cur.execute(
-        f"""
-        INSERT INTO events ({col_sql})
-        VALUES ({ph_sql})
-        RETURNING id, event_date, business, course, time, people, place, admin
-        """,
-        tuple(vals),
-    )
-
-def update_event(cur, event_id: int, event_date: date, business, course, time_, people, place, admin):
-    """
-    존재하는 컬럼만 갱신 (start/end 있으면 같이 갱신)
-    """
-    sets = []
-    vals = []
-
-    # event_date
-    sets.append('"event_date" = %s')
-    vals.append(event_date)
-
-    # 기타 필드
-    for c, v in [
-        ("business", business),
-        ("course", course),
-        ("time", time_),
-        ("people", people),
-        ("place", place),
-        ("admin", admin),
-    ]:
-        sets.append(f'"{c}" = %s')
-        vals.append(v)
-
-    if "start" in DB_COLS:
-        sets.append('"start" = %s')
-        vals.append(event_date.isoformat())
-    if "end" in DB_COLS:
-        sets.append('"end" = %s')
-        vals.append(event_date.isoformat())
-
-    vals.append(event_id)
-
-    cur.execute(
-        f"""
-        UPDATE events
-        SET {", ".join(sets)}
-        WHERE id = %s
-        RETURNING id, event_date, business, course, time, people, place, admin
-        """,
-        tuple(vals),
-    )
-
-# ----------------------------
+# ---------------------------
 # API
-# ----------------------------
-@app.route("/api/events", methods=["GET"])
+# ---------------------------
+@app.errorhandler(Exception)
+def handle_exception(e):
+    # 프론트가 JSON 파싱 실패하지 않도록 항상 JSON으로 응답
+    return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/api/events")
 def api_get_events():
     """
-    Query params:
-    - start=YYYY-MM-DD&end=YYYY-MM-DD (기간 조회)
-    or
-    - month=YYYY-MM (월 조회)
+    ?start=YYYY-MM-DD&end=YYYY-MM-DD (옵션)
     """
     start = request.args.get("start")
     end = request.args.get("end")
-    month = request.args.get("month")
 
     conn = get_db()
-    try:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur = conn.cursor()
 
-        if month:
-            if not re.match(r"^\d{4}-\d{2}$", month.strip()):
-                return jsonify({"ok": False, "error": "month must be YYYY-MM"}), 400
-            y, m = map(int, month.split("-"))
-            start_d = date(y, m, 1)
-            if m == 12:
-                end_d = date(y + 1, 1, 1) - timedelta(days=1)
-            else:
-                end_d = date(y, m + 1, 1) - timedelta(days=1)
-        else:
-            start_d = parse_yyyy_mm_dd(start) if start else None
-            end_d = parse_yyyy_mm_dd(end) if end else None
-            if not (start_d and end_d):
-                today = date.today()
-                start_d = date(today.year, today.month, 1)
-                if today.month == 12:
-                    end_d = date(today.year + 1, 1, 1) - timedelta(days=1)
-                else:
-                    end_d = date(today.year, today.month + 1, 1) - timedelta(days=1)
-
-        # start/end 혼합이 있어도 event_date 기준으로 조회
+    if start and end:
+        s = parse_ymd(start)
+        e = parse_ymd(end)
         cur.execute(
             """
-            SELECT id, event_date, business, course, time, people, place, admin
+            SELECT id, event_date, business, course, time, people, place, admin, group_id
             FROM events
             WHERE event_date BETWEEN %s AND %s
             ORDER BY event_date ASC, id ASC
             """,
-            (start_d, end_d),
+            (s, e),
         )
-        rows = cur.fetchall()
-        return jsonify({"ok": True, "items": [row_to_dict(r) for r in rows]})
-    finally:
-        conn.close()
+    else:
+        cur.execute(
+            """
+            SELECT id, event_date, business, course, time, people, place, admin, group_id
+            FROM events
+            ORDER BY event_date ASC, id ASC
+            """
+        )
 
-@app.route("/api/events", methods=["POST"])
+    rows = cur.fetchall()
+    conn.close()
+
+    # 프론트 호환: start/end 대신 start로 event_date 문자열 제공
+    items = []
+    for r in rows:
+        items.append(
+            {
+                "id": r["id"],
+                "date": r["event_date"].strftime("%Y-%m-%d"),
+                "business": r.get("business") or "",
+                "course": r.get("course") or "",
+                "time": r.get("time") or "",
+                "people": r.get("people") or "",
+                "place": r.get("place") or "",
+                "admin": r.get("admin") or "",
+                "group_id": str(r["group_id"]) if r.get("group_id") else None,
+            }
+        )
+
+    return jsonify({"ok": True, "events": items})
+
+
+@app.post("/api/events")
 def api_create_events():
     """
-    기간 등록 -> 날짜별로 개별 row 생성
-    Body JSON:
+    기간 등록:
     {
       "start": "YYYY-MM-DD",
       "end": "YYYY-MM-DD",
@@ -337,708 +268,869 @@ def api_create_events():
       "time": "...",
       "people": "...",
       "place": "...",
-      "admin": "..."
+      "admin": "...",
+      "excluded_dates": ["YYYY-MM-DD", ...] 또는 "YYYY-MM-DD,YYYY-MM-DD"
+    }
+    => 날짜별 row로 분해 저장
+    """
+    data = request.get_json(silent=True) or {}
+
+    start = safe_str(data.get("start"))
+    end = safe_str(data.get("end"))
+    if not start or not end:
+        return jsonify({"ok": False, "error": "시작/종료일은 YYYY-MM-DD 형식으로 입력하세요."}), 400
+
+    try:
+        s = parse_ymd(start)
+        e = parse_ymd(end)
+    except Exception:
+        return jsonify({"ok": False, "error": "시작/종료일은 YYYY-MM-DD 형식으로 입력하세요."}), 400
+
+    if e < s:
+        return jsonify({"ok": False, "error": "종료일은 시작일보다 빠를 수 없습니다."}), 400
+
+    excluded_list = split_excluded(data.get("excluded_dates"))
+
+    business = safe_str(data.get("business"))
+    course = safe_str(data.get("course"))
+    time = safe_str(data.get("time"))
+    people = safe_str(data.get("people"))
+    place = safe_str(data.get("place"))
+    admin = safe_str(data.get("admin"))
+
+    g = uuid.uuid4()
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    created_ids = []
+    for d in date_range(s, e):
+        ds = d.strftime("%Y-%m-%d")
+        if ds in excluded_list:
+            continue
+        cur.execute(
+            """
+            INSERT INTO events(event_date, business, course, time, people, place, admin, group_id)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id
+            """,
+            (d, business, course, time, people, place, admin, g),
+        )
+        created_ids.append(cur.fetchone()["id"])
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({"ok": True, "created_ids": created_ids, "group_id": str(g)}), 201
+
+
+@app.put("/api/events/<int:event_id>")
+def api_update_event(event_id: int):
+    """
+    날짜 1건(row 1개) 수정
+    {
+      "business": "...",
+      "course": "...",
+      "time": "...",
+      "people": "...",
+      "place": "...",
+      "admin": "...",
+      "date": "YYYY-MM-DD" (옵션: 날짜 이동)
     }
     """
     data = request.get_json(silent=True) or {}
 
-    try:
-        start_d = parse_yyyy_mm_dd(data.get("start"))
-        end_d = parse_yyyy_mm_dd(data.get("end"))
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"날짜 형식 오류: {e}"}), 400
+    new_date = safe_str(data.get("date"))
+    if new_date:
+        try:
+            d = parse_ymd(new_date)
+        except Exception:
+            return jsonify({"ok": False, "error": "date는 YYYY-MM-DD 형식이어야 합니다."}), 400
+    else:
+        d = None
 
-    business = clean_str(data.get("business"))
-    course = clean_str(data.get("course"))
-    time_ = clean_str(data.get("time"))
-    people = clean_str(data.get("people"))
-    place = clean_str(data.get("place"))
-    admin = clean_str(data.get("admin"))
+    fields = {
+        "business": safe_str(data.get("business")),
+        "course": safe_str(data.get("course")),
+        "time": safe_str(data.get("time")),
+        "people": safe_str(data.get("people")),
+        "place": safe_str(data.get("place")),
+        "admin": safe_str(data.get("admin")),
+    }
 
-    conn = get_db()
-    try:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        created = []
-        for d in daterange_inclusive(start_d, end_d):
-            insert_event(cur, d, business, course, time_, people, place, admin)
-            created.append(row_to_dict(cur.fetchone()))
-        conn.commit()
-        return jsonify({"ok": True, "items": created}), 201
-    except Exception as e:
-        conn.rollback()
-        return jsonify({"ok": False, "error": str(e)}), 500
-    finally:
-        conn.close()
+    sets = []
+    vals = []
+    if d is not None:
+        sets.append("event_date = %s")
+        vals.append(d)
 
-@app.route("/api/events/<int:event_id>", methods=["PUT"])
-def api_update_event(event_id: int):
-    data = request.get_json(silent=True) or {}
+    for k, v in fields.items():
+        sets.append(f"{k} = %s")
+        vals.append(v)
 
-    # event_date는 수정 가능(단 UI는 1일만)
-    try:
-        event_date = parse_yyyy_mm_dd(data.get("event_date"))
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"event_date 형식 오류: {e}"}), 400
+    sets.append("updated_at = NOW()")
 
-    business = clean_str(data.get("business"))
-    course = clean_str(data.get("course"))
-    time_ = clean_str(data.get("time"))
-    people = clean_str(data.get("people"))
-    place = clean_str(data.get("place"))
-    admin = clean_str(data.get("admin"))
+    vals.append(event_id)
 
     conn = get_db()
-    try:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        update_event(cur, event_id, event_date, business, course, time_, people, place, admin)
-        row = cur.fetchone()
-        if not row:
-            conn.rollback()
-            return jsonify({"ok": False, "error": "not found"}), 404
-        conn.commit()
-        return jsonify({"ok": True, "item": row_to_dict(row)})
-    except Exception as e:
-        conn.rollback()
-        return jsonify({"ok": False, "error": str(e)}), 500
-    finally:
-        conn.close()
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        UPDATE events
+        SET {", ".join(sets)}
+        WHERE id = %s
+        RETURNING id, event_date, business, course, time, people, place, admin, group_id
+        """,
+        tuple(vals),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
 
-@app.route("/api/events/<int:event_id>", methods=["DELETE"])
+    if not row:
+        return jsonify({"ok": False, "error": "해당 이벤트를 찾을 수 없습니다."}), 404
+
+    return jsonify(
+        {
+            "ok": True,
+            "event": {
+                "id": row["id"],
+                "date": row["event_date"].strftime("%Y-%m-%d"),
+                "business": row.get("business") or "",
+                "course": row.get("course") or "",
+                "time": row.get("time") or "",
+                "people": row.get("people") or "",
+                "place": row.get("place") or "",
+                "admin": row.get("admin") or "",
+                "group_id": str(row["group_id"]) if row.get("group_id") else None,
+            },
+        }
+    )
+
+
+@app.delete("/api/events/<int:event_id>")
 def api_delete_event(event_id: int):
+    """
+    개별 날짜(row 1개) 삭제
+    """
     conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM events WHERE id=%s", (event_id,))
-        if cur.rowcount == 0:
-            conn.rollback()
-            return jsonify({"ok": False, "error": "not found"}), 404
-        conn.commit()
-        return jsonify({"ok": True})
-    except Exception as e:
-        conn.rollback()
-        return jsonify({"ok": False, "error": str(e)}), 500
-    finally:
-        conn.close()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM events WHERE id=%s RETURNING id", (event_id,))
+    row = cur.fetchone()
+    conn.commit()
+    conn.close()
 
-@app.route("/api/businesses", methods=["GET"])
+    if not row:
+        return jsonify({"ok": False, "error": "해당 이벤트를 찾을 수 없습니다."}), 404
+    return jsonify({"ok": True})
+
+
+@app.get("/api/businesses")
 def api_businesses():
+    """
+    사업명 드롭다운을 위한 distinct 목록
+    """
     conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT DISTINCT business
-            FROM events
-            WHERE business IS NOT NULL AND business <> ''
-            ORDER BY business;
-            """
-        )
-        items = [r[0] for r in cur.fetchall()]
-        return jsonify({"ok": True, "items": items})
-    finally:
-        conn.close()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT DISTINCT business
+        FROM events
+        WHERE business IS NOT NULL AND business <> ''
+        ORDER BY business ASC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    items = [r["business"] for r in rows if r.get("business")]
+    return jsonify({"ok": True, "businesses": items})
 
-# ----------------------------
-# Front (Single HTML)
-# ----------------------------
-HTML_PAGE = r"""<!doctype html>
+
+# ---------------------------
+# Frontend (Single-file HTML)
+# ---------------------------
+def _html() -> str:
+    # ⚠️ Python f-string 쓰면 JS의 ${}와 충돌(과거 NameError 원인)
+    # 그래서 절대 f"" 쓰지 않고, 순수 문자열로 제공
+    return r"""<!doctype html>
 <html lang="ko">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>포항산학 월별일정</title>
   <style>
-    :root{ --border:#d7d7d7; --muted:#666; --bg:#fff; }
-    *{box-sizing:border-box;}
-    body{margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,"Noto Sans KR",sans-serif; background:var(--bg); color:#111;}
-    .wrap{max-width:1200px; margin:0 auto; padding:16px 10px 24px;}
-    h1{margin:10px 0 0; text-align:center; font-size:40px; letter-spacing:-1px;}
-    .sub{margin:6px 0 14px; text-align:center; font-size:28px; font-weight:800;}
-    .topbar{display:flex; flex-wrap:wrap; gap:10px; justify-content:center; align-items:center; margin:10px 0 10px;}
-    button, select, input{font-size:16px; padding:10px 12px; border:1px solid var(--border); border-radius:8px; background:#fff;}
-    button{cursor:pointer;}
-    button.primary{font-weight:900;}
-    .btnrow{display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:center;}
-    .filters{display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:center;}
-    .addwide{width:min(900px, 100%); margin:10px auto 12px; display:block; padding:12px 14px; font-size:18px; font-weight:900;}
+    :root{
+      --border:#d9d9d9;
+      --text:#111;
+      --muted:#666;
+      --bg:#fff;
+      --card-radius:14px;
+    }
+    body{margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Apple SD Gothic Neo,Noto Sans KR,sans-serif; color:var(--text); background:var(--bg);}
+    .wrap{max-width:1200px; margin:0 auto; padding:20px 12px 40px;}
+    h1{margin:10px 0 0; text-align:center; font-size:44px; letter-spacing:-1px;}
+    h2{margin:6px 0 18px; text-align:center; font-size:34px; font-weight:800;}
 
-    table.calendar{width:100%; border-collapse:collapse; table-layout:fixed;}
-    table.calendar th, table.calendar td{border:1px solid var(--border); vertical-align:top;}
-    table.calendar th{height:44px; background:#fafafa; font-size:18px;}
-    table.calendar td{height:130px; padding:6px;}
-    .dow-sun{color:#d40000;}
-    .dow-sat{color:#0070c9;}
-    .daynum{font-weight:900; font-size:18px; margin-bottom:6px;}
-    .events{display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:6px; align-content:start;}
-    .event{border-radius:12px; padding:8px 8px; border:1px solid rgba(0,0,0,.08); box-shadow:0 1px 0 rgba(0,0,0,.03); overflow:hidden; min-height:44px; cursor:pointer;}
-    .event .title{font-weight:900; margin-bottom:4px; font-size:14px;}
-    .event .line{font-size:12px; line-height:1.25; word-break:break-word; color:#111;}
-    .event .muted{color:var(--muted);}
-    .event:hover{outline:2px solid rgba(0,0,0,.08);}
+    .toolbar{display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:center; margin:10px 0 12px;}
+    .btn{border:1px solid #bdbdbd; background:#fff; padding:10px 14px; border-radius:10px; font-size:16px; cursor:pointer;}
+    .btn:active{transform:translateY(1px);}
+    .select{border:1px solid #bdbdbd; border-radius:10px; padding:10px 12px; font-size:16px; background:#fff;}
+    .label{font-size:20px; font-weight:700; margin-right:6px;}
+    .spacer{flex:1 1 auto;}
+    .addWide{width:min(100%,760px); padding:14px 18px; font-size:18px; font-weight:800; border-radius:12px;}
 
-    .weekgrid{width:100%; border:1px solid var(--border); border-radius:12px; overflow:hidden;}
-    .weekrow{display:grid; grid-template-columns: 92px 1fr; border-top:1px solid var(--border);}
-    .weekrow:first-child{border-top:none;}
-    .wkdate{padding:10px; background:#fafafa; font-weight:900; border-right:1px solid var(--border);}
-    .wkcontent{padding:10px;}
-    .wkcards{display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:8px;}
+    /* Calendar */
+    .cal{border:1px solid var(--border); border-radius:12px; overflow:hidden; background:#fff;}
+    .dow{display:grid; grid-template-columns:repeat(7,1fr); background:#fafafa; border-bottom:1px solid var(--border);}
+    .dow div{padding:10px 0; text-align:center; font-weight:800;}
+    .dow .sun{color:#d40000;}
+    .dow .sat{color:#0066cc;}
 
-    .modalback{position:fixed; inset:0; background:rgba(0,0,0,.35); display:none; align-items:center; justify-content:center; padding:16px; z-index:50;}
-    .modal{width:min(720px, 100%); background:#fff; border-radius:14px; padding:14px; box-shadow:0 10px 30px rgba(0,0,0,.2);}
-    .modal h2{margin:0 0 10px; font-size:20px;}
-    .grid{display:grid; grid-template-columns:1fr 1fr; gap:10px;}
-    .grid .full{grid-column:1/-1;}
-    .row{display:flex; flex-direction:column; gap:6px;}
-    .row label{font-size:12px; color:var(--muted); font-weight:900;}
-    .actions{display:flex; gap:10px; justify-content:flex-end; margin-top:12px; flex-wrap:wrap;}
+    .grid{display:grid; grid-template-columns:repeat(7,1fr);}
+    .cell{min-height:120px; border-right:1px solid var(--border); border-bottom:1px solid var(--border); padding:8px; position:relative;}
+    .cell:nth-child(7n){border-right:none;}
+    .daynum{font-weight:900; font-size:18px;}
+    .daynum.sun{color:#d40000;}
+    .daynum.sat{color:#0066cc;}
+
+    /* events: 한 칸에 2개씩(자동 줄바꿈) */
+    .events{margin-top:8px; display:flex; flex-wrap:wrap; gap:8px;}
+    .ev{
+      flex:0 0 calc(50% - 4px);
+      box-sizing:border-box;
+      border-radius:14px;
+      padding:10px 10px;
+      border:1px solid rgba(0,0,0,.08);
+      background:var(--evbg, #f3f3f3);
+      cursor:pointer;
+      overflow:hidden;
+    }
+    .ev strong{display:block; font-size:18px; margin-bottom:6px;}
+    .ev .line{font-size:14px; color:#222; line-height:1.25; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+    .ev .muted{color:var(--muted);}
+
+    /* Week view */
+    .weekWrap{border:1px solid var(--border); border-radius:12px; overflow:hidden;}
+    .weekRow{display:grid; grid-template-columns:120px 1fr; border-bottom:1px solid var(--border);}
+    .weekRow:last-child{border-bottom:none;}
+    .weekDate{padding:12px; font-weight:900; background:#fafafa; border-right:1px solid var(--border);}
+    .weekList{padding:10px;}
+    .weekList .events{margin-top:0}
+
+    /* Modal */
+    .modalBack{position:fixed; inset:0; background:rgba(0,0,0,.35); display:none; align-items:center; justify-content:center; padding:14px; z-index:50;}
+    .modal{width:min(820px, 100%); background:#fff; border-radius:16px; padding:18px; box-shadow:0 10px 30px rgba(0,0,0,.2);}
+    .modal h3{margin:0 0 12px; font-size:22px;}
+    .formGrid{display:grid; grid-template-columns:1fr 1fr; gap:12px;}
+    .field label{display:block; font-weight:800; margin:0 0 6px;}
+    .field input, .field textarea{
+      width:100%; box-sizing:border-box;
+      border:1px solid #cfcfcf; border-radius:10px;
+      padding:12px; font-size:16px;
+    }
+    .actions{display:flex; gap:10px; justify-content:flex-end; margin-top:14px;}
     .danger{border-color:#ffb3b3; background:#fff5f5;}
-    .small{font-size:12px; color:var(--muted);}
+    .hint{font-size:13px; color:var(--muted); margin-top:6px;}
 
-    @media (max-width: 820px){
+    /* Mobile 개선 */
+    @media (max-width: 720px){
+      .wrap{padding:14px 10px 26px;}
       h1{font-size:34px;}
-      .sub{font-size:22px;}
-      table.calendar td{height:120px;}
-      .events{grid-template-columns: 1fr;} /* 모바일은 1열로 가독성 */
-      .grid{grid-template-columns:1fr;}
-      .wkcards{grid-template-columns: 1fr;}
+      h2{font-size:26px;}
+      .label{font-size:18px;}
+      .btn,.select{font-size:15px; padding:10px 12px;}
+      .addWide{font-size:17px;}
+      .cell{min-height:110px; padding:7px;}
+      .ev{flex:0 0 100%; padding:10px;}
+      .ev strong{font-size:16px;}
+      .ev .line{font-size:13px;}
+      .formGrid{grid-template-columns:1fr;}
     }
-
-    /* 가로모드(회전) */
-    body.force-landscape .wrap{
-      transform: rotate(90deg);
-      transform-origin: top left;
-      position:absolute;
-      top:0;
-      left:100%;
-      width:100vh;
-      min-height:100vw;
-      padding:10px;
-      background:#fff;
-    }
-    body.force-landscape{height:100vw; overflow:auto;}
   </style>
 </head>
+
 <body>
   <div class="wrap">
     <h1>포항산학 월별일정</h1>
-    <div class="sub" id="titleYM">-</div>
+    <h2 id="ymTitle">-</h2>
 
-    <div class="topbar">
-      <div class="btnrow">
-        <button id="btnPrev">◀ 이전</button>
-        <button id="btnNext">다음 ▶</button>
-        <button id="btnMonth" class="primary">월별</button>
-        <button id="btnWeek">주별</button>
-        <button id="btnRotate">가로모드</button>
-      </div>
-      <div class="filters">
-        <div style="display:flex; align-items:center; gap:8px;">
-          <span style="font-weight:900;">사업명:</span>
-          <select id="bizFilter"><option value="__ALL__">전체</option></select>
-        </div>
-        <button id="btnReset">필터 초기화</button>
-      </div>
+    <div class="toolbar">
+      <button class="btn" id="prevBtn">◀ 이전</button>
+      <button class="btn" id="nextBtn">다음 ▶</button>
+      <button class="btn" id="monthBtn">월별</button>
+      <button class="btn" id="weekBtn">주별</button>
+
+      <span class="label">사업명:</span>
+      <select class="select" id="bizFilter">
+        <option value="">전체</option>
+      </select>
+      <button class="btn" id="resetFilterBtn">필터 초기화</button>
     </div>
 
-    <button class="addwide" id="btnAdd">+ 일정 추가하기</button>
+    <div class="toolbar" style="margin-top:6px">
+      <button class="btn addWide" id="openAddBtn">+ 일정 추가하기</button>
+    </div>
 
-    <div id="monthView"></div>
-    <div id="weekView" style="display:none;"></div>
+    <div id="viewHost"></div>
   </div>
 
-  <div class="modalback" id="modalBack">
+  <!-- Add modal (기간 등록) -->
+  <div class="modalBack" id="addBack">
     <div class="modal">
-      <h2 id="modalTitle">일정</h2>
+      <h3>일정 추가(기간 등록)</h3>
 
-      <div class="grid">
-        <div class="row">
+      <div class="formGrid">
+        <div class="field">
           <label>시작일 (YYYY-MM-DD)</label>
-          <input id="fStart" placeholder="2026-01-05" />
+          <input type="date" id="addStart" />
         </div>
-        <div class="row">
+        <div class="field">
           <label>종료일 (YYYY-MM-DD)</label>
-          <input id="fEnd" placeholder="2026-01-09" />
+          <input type="date" id="addEnd" />
         </div>
 
-        <div class="row full">
+        <div class="field" style="grid-column:1/-1">
           <label>사업명</label>
-          <input id="fBusiness" placeholder="예: 지산맞 / 재직자 / 청년일경험 ..." />
+          <input type="text" id="addBusiness" placeholder="예: 지산맞, 일학습, 대관 등" />
         </div>
 
-        <div class="row full">
+        <div class="field" style="grid-column:1/-1">
           <label>과정</label>
-          <input id="fCourse" placeholder="예: 파이썬, 용접, 전기..." />
+          <input type="text" id="addCourse" />
         </div>
 
-        <div class="row">
+        <div class="field">
           <label>시간</label>
-          <input id="fTime" placeholder="예: 09:00~18:00" />
+          <input type="text" id="addTime" placeholder="예: 10:00~14:00" />
         </div>
-        <div class="row">
+        <div class="field">
           <label>인원</label>
-          <input id="fPeople" placeholder="예: 20" />
+          <input type="text" id="addPeople" placeholder="예: 10" />
         </div>
 
-        <div class="row">
+        <div class="field">
           <label>장소</label>
-          <input id="fPlace" placeholder="예: 1강의실 / 실습실..." />
+          <input type="text" id="addPlace" placeholder="예: 본관3층" />
         </div>
-        <div class="row">
+        <div class="field">
           <label>행정</label>
-          <input id="fAdmin" placeholder="예: 담당자명" />
+          <input type="text" id="addAdmin" placeholder="예: 담당자명" />
         </div>
 
-        <div class="row full small" id="editHint" style="display:none;">
-          ※ 기간등록은 “새로 추가”에서만 사용됩니다. 이미 등록된 일정은 날짜별로 개별 수정/삭제가 가능합니다.
+        <div class="field" style="grid-column:1/-1">
+          <label>제외할 날짜(선택)</label>
+          <input type="text" id="addExcluded" placeholder="예: 2026-01-07,2026-01-08" />
+          <div class="hint">기간 중 특정 날짜만 빼고 저장하고 싶을 때 사용</div>
         </div>
       </div>
 
       <div class="actions">
-        <button id="btnDelete" class="danger" style="display:none;">이 날짜 일정 삭제</button>
-        <button id="btnSave" class="primary">저장</button>
-        <button id="btnClose">닫기</button>
+        <button class="btn" id="addCloseBtn">닫기</button>
+        <button class="btn" id="addSaveBtn">저장</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Detail modal (개별 날짜 수정/삭제) -->
+  <div class="modalBack" id="detailBack">
+    <div class="modal">
+      <h3>일정 상세</h3>
+
+      <div class="formGrid">
+        <div class="field">
+          <label>날짜</label>
+          <input type="date" id="dDate" />
+        </div>
+        <div class="field">
+          <label>사업명</label>
+          <input type="text" id="dBusiness" />
+        </div>
+
+        <div class="field" style="grid-column:1/-1">
+          <label>과정</label>
+          <input type="text" id="dCourse" />
+        </div>
+
+        <div class="field">
+          <label>시간</label>
+          <input type="text" id="dTime" />
+        </div>
+        <div class="field">
+          <label>인원</label>
+          <input type="text" id="dPeople" />
+        </div>
+
+        <div class="field">
+          <label>장소</label>
+          <input type="text" id="dPlace" />
+        </div>
+        <div class="field">
+          <label>행정</label>
+          <input type="text" id="dAdmin" />
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="btn danger" id="dDeleteBtn">이 날짜 삭제</button>
+        <button class="btn" id="dCloseBtn">닫기</button>
+        <button class="btn" id="dSaveBtn">저장</button>
       </div>
     </div>
   </div>
 
 <script>
-  let mode = "month";
-  let cur = new Date();
-  let allEvents = [];
-  let biz = "__ALL__";
-  let editingId = null;
+  const viewHost = document.getElementById('viewHost');
+  const ymTitle = document.getElementById('ymTitle');
 
-  const pad2 = (n) => String(n).padStart(2, "0");
-  const fmtDate = (d) => `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
-  const yyyymm = (d) => `${d.getFullYear()}-${pad2(d.getMonth()+1)}`;
+  const bizFilter = document.getElementById('bizFilter');
+  const resetFilterBtn = document.getElementById('resetFilterBtn');
 
-  const parseDate = (s) => {
-    if(!s) return null;
-    s = String(s).trim();
-    s = s.replace(/[‐-‒–—―−]/g, "-").replace(/[./]/g, "-");
-    if(!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
-    const [y,m,da] = s.split("-").map(Number);
-    const d = new Date(y, m-1, da);
-    if(d.getFullYear()!==y || d.getMonth()!==m-1 || d.getDate()!==da) return null;
-    return d;
-  };
+  const prevBtn = document.getElementById('prevBtn');
+  const nextBtn = document.getElementById('nextBtn');
+  const monthBtn = document.getElementById('monthBtn');
+  const weekBtn = document.getElementById('weekBtn');
 
-  const startOfWeek = (d) => {
-    const x = new Date(d);
-    const day = x.getDay();
-    x.setDate(x.getDate() - day);
-    x.setHours(0,0,0,0);
-    return x;
-  };
-  const endOfWeek = (d) => {
-    const s = startOfWeek(d);
-    const e = new Date(s);
-    e.setDate(e.getDate()+6);
-    return e;
-  };
+  const addBack = document.getElementById('addBack');
+  const openAddBtn = document.getElementById('openAddBtn');
+  const addCloseBtn = document.getElementById('addCloseBtn');
+  const addSaveBtn = document.getElementById('addSaveBtn');
 
-  function escapeHtml(s){
-    return String(s)
-      .replaceAll("&","&amp;")
-      .replaceAll("<","&lt;")
-      .replaceAll(">","&gt;")
-      .replaceAll('"',"&quot;")
-      .replaceAll("'","&#39;");
+  const detailBack = document.getElementById('detailBack');
+  const dCloseBtn = document.getElementById('dCloseBtn');
+  const dSaveBtn = document.getElementById('dSaveBtn');
+  const dDeleteBtn = document.getElementById('dDeleteBtn');
+
+  const addStart = document.getElementById('addStart');
+  const addEnd = document.getElementById('addEnd');
+  const addBusiness = document.getElementById('addBusiness');
+  const addCourse = document.getElementById('addCourse');
+  const addTime = document.getElementById('addTime');
+  const addPeople = document.getElementById('addPeople');
+  const addPlace = document.getElementById('addPlace');
+  const addAdmin = document.getElementById('addAdmin');
+  const addExcluded = document.getElementById('addExcluded');
+
+  const dDate = document.getElementById('dDate');
+  const dBusiness = document.getElementById('dBusiness');
+  const dCourse = document.getElementById('dCourse');
+  const dTime = document.getElementById('dTime');
+  const dPeople = document.getElementById('dPeople');
+  const dPlace = document.getElementById('dPlace');
+  const dAdmin = document.getElementById('dAdmin');
+
+  let mode = 'month'; // month | week
+  let current = new Date();
+  current.setHours(0,0,0,0);
+
+  let allEvents = []; // {id,date,business,course,time,people,place,admin,group_id}
+  let selectedEventId = null;
+
+  function ymd(d){
+    const y = d.getFullYear();
+    const m = String(d.getMonth()+1).padStart(2,'0');
+    const day = String(d.getDate()).padStart(2,'0');
+    return `${y}-${m}-${day}`;
+  }
+  function parseYMD(s){
+    const [y,m,d] = s.split('-').map(n=>parseInt(n,10));
+    const dt = new Date(y, m-1, d);
+    dt.setHours(0,0,0,0);
+    return dt;
+  }
+  function sameDay(a,b){
+    return a.getFullYear()===b.getFullYear() && a.getMonth()===b.getMonth() && a.getDate()===b.getDate();
   }
 
-  function hashHue(str){
-    let h = 0;
-    for(let i=0;i<str.length;i++){
-      h = (h*31 + str.charCodeAt(i)) % 360;
+  function hslForBusiness(name){
+    // 사업명별 색상: 문자열 해시
+    const s = (name||'').trim();
+    if(!s) return 'hsl(0 0% 92%)';
+    let hash = 0;
+    for(let i=0;i<s.length;i++){
+      hash = ((hash<<5)-hash) + s.charCodeAt(i);
+      hash |= 0;
     }
-    return h;
-  }
-  function bizColor(b){
-    if(!b) return "hsl(210 70% 92%)";
-    const h = hashHue(b);
+    const h = Math.abs(hash) % 360;
     return `hsl(${h} 70% 88%)`;
   }
 
-  function fieldLine(label, value){
-    if(!value) return "";
-    return `<div class="line"><span class="muted">${label}</span> ${escapeHtml(value)}</div>`;
-  }
-
-  async function apiGetEventsForCurrent(){
-    if(mode==="month"){
-      const m = yyyymm(cur);
-      const r = await fetch(`/api/events?month=${encodeURIComponent(m)}`);
-      const j = await r.json();
-      if(!j.ok) throw new Error(j.error || "불러오기 실패");
-      allEvents = j.items || [];
-    }else{
-      const s = startOfWeek(cur);
-      const e = endOfWeek(cur);
-      const r = await fetch(`/api/events?start=${fmtDate(s)}&end=${fmtDate(e)}`);
-      const j = await r.json();
-      if(!j.ok) throw new Error(j.error || "불러오기 실패");
-      allEvents = j.items || [];
-    }
-  }
-
-  async function apiBusinesses(){
-    const r = await fetch(`/api/businesses`);
-    const j = await r.json();
-    if(!j.ok) return [];
-    return j.items || [];
-  }
-
-  async function apiCreateRange(payload){
-    const r = await fetch(`/api/events`, {
-      method:"POST",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify(payload)
-    });
-    const j = await r.json().catch(()=>({ok:false, error:"서버 응답 파싱 실패"}));
-    if(!j.ok) throw new Error(j.error || "저장 실패");
-    return j.items;
-  }
-
-  async function apiUpdateOne(id, payload){
-    const r = await fetch(`/api/events/${id}`, {
-      method:"PUT",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify(payload)
-    });
-    const j = await r.json().catch(()=>({ok:false, error:"서버 응답 파싱 실패"}));
-    if(!j.ok) throw new Error(j.error || "수정 실패");
-    return j.item;
-  }
-
-  async function apiDeleteOne(id){
-    const r = await fetch(`/api/events/${id}`, { method:"DELETE" });
-    const j = await r.json().catch(()=>({ok:false, error:"서버 응답 파싱 실패"}));
-    if(!j.ok) throw new Error(j.error || "삭제 실패");
-    return true;
-  }
-
   function filteredEvents(){
-    if(biz==="__ALL__") return allEvents;
-    return allEvents.filter(e => (e.business||"") === biz);
+    const f = bizFilter.value;
+    if(!f) return allEvents;
+    return allEvents.filter(e => (e.business||'') === f);
   }
 
-  function renderTitle(){
-    const t = document.getElementById("titleYM");
-    if(mode==="month"){
-      t.textContent = `${cur.getFullYear()}년 ${cur.getMonth()+1}월`;
-    }else{
-      const s = startOfWeek(cur);
-      const e = endOfWeek(cur);
-      t.textContent = `${s.getFullYear()}년 ${s.getMonth()+1}월 ${s.getDate()}일 ~ ${e.getFullYear()}년 ${e.getMonth()+1}월 ${e.getDate()}일`;
-    }
-  }
+  async function loadBusinesses(){
+    const res = await fetch('/api/businesses');
+    const j = await res.json();
+    if(!j.ok) return;
+    const keep = bizFilter.value;
 
-  function renderMonth(){
-    const container = document.getElementById("monthView");
-    container.innerHTML = "";
-
-    const y = cur.getFullYear();
-    const m = cur.getMonth();
-    const first = new Date(y, m, 1);
-    const last = new Date(y, m+1, 0);
-
-    const startDay = first.getDay();
-    const totalDays = last.getDate();
-
-    const events = filteredEvents();
-    const byDate = new Map();
-    for(const e of events){
-      if(!e.event_date) continue;
-      if(!byDate.has(e.event_date)) byDate.set(e.event_date, []);
-      byDate.get(e.event_date).push(e);
-    }
-
-    const table = document.createElement("table");
-    table.className = "calendar";
-
-    const thead = document.createElement("thead");
-    const trh = document.createElement("tr");
-    ["일","월","화","수","목","금","토"].forEach((d,i)=>{
-      const th = document.createElement("th");
-      th.textContent = d;
-      if(i===0) th.classList.add("dow-sun");
-      if(i===6) th.classList.add("dow-sat");
-      trh.appendChild(th);
+    // reset options
+    bizFilter.innerHTML = '<option value="">전체</option>';
+    j.businesses.forEach(b=>{
+      const op = document.createElement('option');
+      op.value = b;
+      op.textContent = b;
+      bizFilter.appendChild(op);
     });
-    thead.appendChild(trh);
-    table.appendChild(thead);
-
-    const tbody = document.createElement("tbody");
-    let day = 1;
-
-    for(let r=0; r<6; r++){
-      const tr = document.createElement("tr");
-      for(let c=0; c<7; c++){
-        const td = document.createElement("td");
-        const cellIndex = r*7 + c;
-
-        if(cellIndex < startDay || day > totalDays){
-          td.innerHTML = "";
-        }else{
-          const d = new Date(y, m, day);
-          const key = fmtDate(d);
-
-          const daynum = document.createElement("div");
-          daynum.className = "daynum";
-          daynum.textContent = day;
-          if(c===0) daynum.style.color = "#d40000";
-          if(c===6) daynum.style.color = "#0070c9";
-          td.appendChild(daynum);
-
-          const evWrap = document.createElement("div");
-          evWrap.className = "events";
-
-          const list = (byDate.get(key) || []);
-          for(const e of list){
-            const card = document.createElement("div");
-            card.className = "event";
-            card.style.background = bizColor(e.business || "");
-            card.innerHTML = `
-              <div class="title">${escapeHtml(e.course || e.business || "일정")}</div>
-              ${fieldLine("사업:", e.business)}
-              ${fieldLine("시간:", e.time)}
-              ${fieldLine("인원:", e.people)}
-              ${fieldLine("장소:", e.place)}
-              ${fieldLine("행정:", e.admin)}
-            `;
-            card.addEventListener("click", ()=> openEdit(e));
-            evWrap.appendChild(card);
-          }
-
-          td.appendChild(evWrap);
-          day++;
-        }
-        tr.appendChild(td);
-      }
-      tbody.appendChild(tr);
-      if(day > totalDays) break;
-    }
-
-    table.appendChild(tbody);
-    container.appendChild(table);
+    bizFilter.value = keep;
   }
 
-  function renderWeek(){
-    const container = document.getElementById("weekView");
-    container.innerHTML = "";
-
-    const events = filteredEvents();
-    const byDate = new Map();
-    for(const e of events){
-      if(!e.event_date) continue;
-      if(!byDate.has(e.event_date)) byDate.set(e.event_date, []);
-      byDate.get(e.event_date).push(e);
+  async function loadEventsRange(start, end){
+    const res = await fetch(`/api/events?start=${start}&end=${end}`);
+    const j = await res.json();
+    if(!j.ok){
+      alert(j.error || '불러오기 실패');
+      return [];
     }
-
-    const grid = document.createElement("div");
-    grid.className = "weekgrid";
-
-    const s = startOfWeek(cur);
-    const dows = ["일","월","화","수","목","금","토"];
-
-    for(let i=0;i<7;i++){
-      const d = new Date(s);
-      d.setDate(d.getDate()+i);
-      const key = fmtDate(d);
-
-      const row = document.createElement("div");
-      row.className = "weekrow";
-
-      const left = document.createElement("div");
-      left.className = "wkdate";
-      left.textContent = `${d.getMonth()+1}/${d.getDate()} (${dows[d.getDay()]})`;
-
-      const right = document.createElement("div");
-      right.className = "wkcontent";
-
-      const cards = document.createElement("div");
-      cards.className = "wkcards";
-
-      const list = (byDate.get(key) || []);
-      for(const e of list){
-        const card = document.createElement("div");
-        card.className = "event";
-        card.style.background = bizColor(e.business || "");
-        card.innerHTML = `
-          <div class="title">${escapeHtml(e.course || e.business || "일정")}</div>
-          ${fieldLine("사업:", e.business)}
-          ${fieldLine("시간:", e.time)}
-          ${fieldLine("인원:", e.people)}
-          ${fieldLine("장소:", e.place)}
-          ${fieldLine("행정:", e.admin)}
-        `;
-        card.addEventListener("click", ()=> openEdit(e));
-        cards.appendChild(card);
-      }
-
-      right.appendChild(cards);
-      row.appendChild(left);
-      row.appendChild(right);
-      grid.appendChild(row);
-    }
-
-    container.appendChild(grid);
+    return j.events || [];
   }
 
   async function refresh(){
-    renderTitle();
-    await apiGetEventsForCurrent();
+    // month: 해당 월 범위, week: 해당 주 범위만 로드
+    let start, end;
 
-    if(mode==="month"){
-      document.getElementById("monthView").style.display = "";
-      document.getElementById("weekView").style.display = "none";
-      renderMonth();
+    if(mode === 'month'){
+      const y = current.getFullYear();
+      const m = current.getMonth();
+      const first = new Date(y, m, 1);
+      const last = new Date(y, m+1, 0);
+      start = ymd(first);
+      end = ymd(last);
+      ymTitle.textContent = `${y}년 ${m+1}월`;
     }else{
-      document.getElementById("monthView").style.display = "none";
-      document.getElementById("weekView").style.display = "";
-      renderWeek();
+      const d = new Date(current);
+      const day = d.getDay(); // 0 sun
+      const diff = day; // sunday start
+      const ws = new Date(d);
+      ws.setDate(d.getDate()-diff);
+      const we = new Date(ws);
+      we.setDate(ws.getDate()+6);
+      start = ymd(ws);
+      end = ymd(we);
+      ymTitle.textContent = `${start} ~ ${end}`;
     }
 
-    const list = await apiBusinesses();
-    const sel = document.getElementById("bizFilter");
-    const keep = sel.value || "__ALL__";
-    sel.innerHTML = `<option value="__ALL__">전체</option>` + list.map(x=>`<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join("");
-    if([...sel.options].some(o=>o.value===keep)) sel.value = keep;
-    biz = sel.value;
-    renderTitle();
+    allEvents = await loadEventsRange(start, end);
+    await loadBusinesses();
+    render();
+  }
+
+  function render(){
+    viewHost.innerHTML = '';
+    if(mode==='month') renderMonth();
+    else renderWeek();
+  }
+
+  function renderMonth(){
+    const y = current.getFullYear();
+    const m = current.getMonth();
+    const first = new Date(y, m, 1);
+    const last = new Date(y, m+1, 0);
+
+    const startCell = new Date(first);
+    startCell.setDate(1 - first.getDay()); // sunday start
+
+    const endCell = new Date(last);
+    endCell.setDate(last.getDate() + (6 - last.getDay()));
+
+    const cal = document.createElement('div');
+    cal.className = 'cal';
+
+    const dow = document.createElement('div');
+    dow.className = 'dow';
+    ['일','월','화','수','목','금','토'].forEach((t,i)=>{
+      const div = document.createElement('div');
+      div.textContent = t;
+      if(i===0) div.classList.add('sun');
+      if(i===6) div.classList.add('sat');
+      dow.appendChild(div);
+    });
+    cal.appendChild(dow);
+
+    const grid = document.createElement('div');
+    grid.className = 'grid';
+
+    const evs = filteredEvents();
+
+    let cur = new Date(startCell);
+    while(cur <= endCell){
+      const cell = document.createElement('div');
+      cell.className = 'cell';
+
+      const num = document.createElement('div');
+      num.className = 'daynum';
+      if(cur.getDay()===0) num.classList.add('sun');
+      if(cur.getDay()===6) num.classList.add('sat');
+      num.textContent = cur.getDate();
+      cell.appendChild(num);
+
+      const list = document.createElement('div');
+      list.className = 'events';
+
+      const ds = ymd(cur);
+      const dayEvents = evs.filter(e => e.date === ds);
+
+      dayEvents.forEach(e=>{
+        const card = document.createElement('div');
+        card.className = 'ev';
+        card.style.setProperty('--evbg', hslForBusiness(e.business));
+        card.onclick = ()=> openDetail(e);
+
+        const title = document.createElement('strong');
+        title.textContent = e.business || '(사업명 없음)';
+        card.appendChild(title);
+
+        // 공란이면 라인 자체를 숨김 (요청사항)
+        function addLine(label, value){
+          if(!value) return;
+          const div = document.createElement('div');
+          div.className='line';
+          div.textContent = `${label}: ${value}`;
+          card.appendChild(div);
+        }
+        addLine('과정', e.course);
+        addLine('시간', e.time);
+        addLine('인원', e.people);
+        addLine('장소', e.place);
+        addLine('행정', e.admin);
+
+        list.appendChild(card);
+      });
+
+      cell.appendChild(list);
+      grid.appendChild(cell);
+
+      cur.setDate(cur.getDate()+1);
+    }
+
+    cal.appendChild(grid);
+    viewHost.appendChild(cal);
+  }
+
+  function renderWeek(){
+    const base = new Date(current);
+    const day = base.getDay();
+    const ws = new Date(base);
+    ws.setDate(base.getDate()-day);
+    const rows = [];
+
+    const wrap = document.createElement('div');
+    wrap.className = 'weekWrap';
+
+    const evs = filteredEvents();
+
+    for(let i=0;i<7;i++){
+      const d = new Date(ws);
+      d.setDate(ws.getDate()+i);
+      const ds = ymd(d);
+
+      const row = document.createElement('div');
+      row.className = 'weekRow';
+
+      const left = document.createElement('div');
+      left.className='weekDate';
+      left.textContent = `${ds} (${['일','월','화','수','목','금','토'][d.getDay()]})`;
+
+      const right = document.createElement('div');
+      right.className='weekList';
+
+      const list = document.createElement('div');
+      list.className='events';
+
+      evs.filter(e=>e.date===ds).forEach(e=>{
+        const card = document.createElement('div');
+        card.className='ev';
+        card.style.setProperty('--evbg', hslForBusiness(e.business));
+        card.onclick = ()=> openDetail(e);
+
+        const title = document.createElement('strong');
+        title.textContent = e.business || '(사업명 없음)';
+        card.appendChild(title);
+
+        function addLine(label, value){
+          if(!value) return;
+          const div = document.createElement('div');
+          div.className='line';
+          div.textContent = `${label}: ${value}`;
+          card.appendChild(div);
+        }
+        addLine('과정', e.course);
+        addLine('시간', e.time);
+        addLine('인원', e.people);
+        addLine('장소', e.place);
+        addLine('행정', e.admin);
+
+        list.appendChild(card);
+      });
+
+      right.appendChild(list);
+      row.appendChild(left);
+      row.appendChild(right);
+      wrap.appendChild(row);
+    }
+
+    viewHost.appendChild(wrap);
   }
 
   function openAdd(){
-    editingId = null;
-    document.getElementById("modalTitle").textContent = "일정 추가(기간 등록)";
-    document.getElementById("btnDelete").style.display = "none";
-    document.getElementById("editHint").style.display = "none";
-
     const today = new Date();
-    document.getElementById("fStart").value = fmtDate(today);
-    document.getElementById("fEnd").value = fmtDate(today);
+    const ds = ymd(today);
+    addStart.value = ds;
+    addEnd.value = ds;
+    addBusiness.value = '';
+    addCourse.value = '';
+    addTime.value = '';
+    addPeople.value = '';
+    addPlace.value = '';
+    addAdmin.value = '';
+    addExcluded.value = '';
+    addBack.style.display='flex';
+  }
+  function closeAdd(){ addBack.style.display='none'; }
 
-    ["fBusiness","fCourse","fTime","fPeople","fPlace","fAdmin"].forEach(id=>{
-      document.getElementById(id).value = "";
+  async function saveAdd(){
+    const s = addStart.value;
+    const e = addEnd.value;
+
+    if(!s || !e){
+      alert('시작/종료일은 YYYY-MM-DD 형식으로 입력하세요.');
+      return;
+    }
+
+    const payload = {
+      start: s,
+      end: e,
+      business: addBusiness.value.trim(),
+      course: addCourse.value.trim(),
+      time: addTime.value.trim(),
+      people: addPeople.value.trim(),
+      place: addPlace.value.trim(),
+      admin: addAdmin.value.trim(),
+      excluded_dates: addExcluded.value.trim()
+    };
+
+    const res = await fetch('/api/events', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
     });
 
-    document.getElementById("modalBack").style.display = "flex";
-  }
-
-  function openEdit(e){
-    editingId = e.id;
-    document.getElementById("modalTitle").textContent = `일정 수정 (해당 날짜만)`;
-    document.getElementById("btnDelete").style.display = "";
-    document.getElementById("editHint").style.display = "";
-
-    document.getElementById("fStart").value = e.event_date || "";
-    document.getElementById("fEnd").value = e.event_date || "";
-    document.getElementById("fBusiness").value = e.business || "";
-    document.getElementById("fCourse").value = e.course || "";
-    document.getElementById("fTime").value = e.time || "";
-    document.getElementById("fPeople").value = e.people || "";
-    document.getElementById("fPlace").value = e.place || "";
-    document.getElementById("fAdmin").value = e.admin || "";
-
-    document.getElementById("modalBack").style.display = "flex";
-  }
-
-  function closeModal(){ document.getElementById("modalBack").style.display = "none"; }
-
-  async function onSave(){
-    try{
-      const s = parseDate(document.getElementById("fStart").value);
-      const e = parseDate(document.getElementById("fEnd").value);
-      if(!s || !e) return alert("시작/종료일은 YYYY-MM-DD 형식으로 입력하세요.");
-
-      const payload = {
-        start: fmtDate(s),
-        end: fmtDate(e),
-        business: document.getElementById("fBusiness").value.trim(),
-        course: document.getElementById("fCourse").value.trim(),
-        time: document.getElementById("fTime").value.trim(),
-        people: document.getElementById("fPeople").value.trim(),
-        place: document.getElementById("fPlace").value.trim(),
-        admin: document.getElementById("fAdmin").value.trim()
-      };
-
-      if(editingId){
-        if(payload.start !== payload.end){
-          return alert("수정은 날짜별(1일)만 가능합니다. 시작일과 종료일을 같은 날짜로 맞춰주세요.");
-        }
-        await apiUpdateOne(editingId, {
-          event_date: payload.start,
-          business: payload.business,
-          course: payload.course,
-          time: payload.time,
-          people: payload.people,
-          place: payload.place,
-          admin: payload.admin
-        });
-      }else{
-        await apiCreateRange(payload);
-      }
-
-      closeModal();
-      await refresh();
-    }catch(err){
-      alert("저장 중 오류가 발생했습니다.\n" + (err?.message || err));
+    const j = await res.json().catch(()=>null);
+    if(!j || !j.ok){
+      alert((j && j.error) ? j.error : '저장 중 오류가 발생했습니다.');
+      return;
     }
+
+    closeAdd();
+    await refresh();
   }
 
-  async function onDelete(){
-    if(!editingId) return;
-    if(!confirm("이 날짜의 일정만 삭제할까요?")) return;
-    try{
-      await apiDeleteOne(editingId);
-      closeModal();
-      await refresh();
-    }catch(err){
-      alert("삭제 중 오류가 발생했습니다.\n" + (err?.message || err));
+  function openDetail(e){
+    selectedEventId = e.id;
+    dDate.value = e.date;
+    dBusiness.value = e.business || '';
+    dCourse.value = e.course || '';
+    dTime.value = e.time || '';
+    dPeople.value = e.people || '';
+    dPlace.value = e.place || '';
+    dAdmin.value = e.admin || '';
+    detailBack.style.display='flex';
+  }
+  function closeDetail(){ detailBack.style.display='none'; selectedEventId=null; }
+
+  async function saveDetail(){
+    if(!selectedEventId) return;
+
+    const payload = {
+      date: dDate.value,
+      business: dBusiness.value.trim(),
+      course: dCourse.value.trim(),
+      time: dTime.value.trim(),
+      people: dPeople.value.trim(),
+      place: dPlace.value.trim(),
+      admin: dAdmin.value.trim()
+    };
+
+    const res = await fetch(`/api/events/${selectedEventId}`,{
+      method:'PUT',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const j = await res.json().catch(()=>null);
+    if(!j || !j.ok){
+      alert((j && j.error) ? j.error : '수정 중 오류가 발생했습니다.');
+      return;
     }
+    closeDetail();
+    await refresh();
   }
 
-  document.getElementById("btnAdd").addEventListener("click", openAdd);
-  document.getElementById("btnClose").addEventListener("click", closeModal);
-  document.getElementById("modalBack").addEventListener("click", (e)=>{ if(e.target.id==="modalBack") closeModal(); });
-  document.getElementById("btnSave").addEventListener("click", onSave);
-  document.getElementById("btnDelete").addEventListener("click", onDelete);
+  async function deleteDetail(){
+    if(!selectedEventId) return;
+    if(!confirm('이 날짜 일정만 삭제할까요?')) return;
 
-  document.getElementById("bizFilter").addEventListener("change", async (e)=>{ biz = e.target.value; await refresh(); });
-  document.getElementById("btnReset").addEventListener("click", async ()=>{ biz="__ALL__"; document.getElementById("bizFilter").value="__ALL__"; await refresh(); });
-
-  document.getElementById("btnMonth").addEventListener("click", async ()=>{
-    mode="month";
-    document.getElementById("btnMonth").classList.add("primary");
-    document.getElementById("btnWeek").classList.remove("primary");
+    const res = await fetch(`/api/events/${selectedEventId}`, {method:'DELETE'});
+    const j = await res.json().catch(()=>null);
+    if(!j || !j.ok){
+      alert((j && j.error) ? j.error : '삭제 중 오류가 발생했습니다.');
+      return;
+    }
+    closeDetail();
     await refresh();
-  });
-  document.getElementById("btnWeek").addEventListener("click", async ()=>{
-    mode="week";
-    document.getElementById("btnWeek").classList.add("primary");
-    document.getElementById("btnMonth").classList.remove("primary");
-    await refresh();
-  });
+  }
 
-  document.getElementById("btnPrev").addEventListener("click", async ()=>{
-    if(mode==="month") cur = new Date(cur.getFullYear(), cur.getMonth()-1, 1);
-    else { cur = new Date(cur); cur.setDate(cur.getDate()-7); }
-    await refresh();
-  });
-  document.getElementById("btnNext").addEventListener("click", async ()=>{
-    if(mode==="month") cur = new Date(cur.getFullYear(), cur.getMonth()+1, 1);
-    else { cur = new Date(cur); cur.setDate(cur.getDate()+7); }
-    await refresh();
-  });
+  // events
+  openAddBtn.onclick = openAdd;
+  addCloseBtn.onclick = closeAdd;
+  addSaveBtn.onclick = saveAdd;
 
-  document.getElementById("btnRotate").addEventListener("click", ()=> document.body.classList.toggle("force-landscape"));
+  dCloseBtn.onclick = closeDetail;
+  dSaveBtn.onclick = saveDetail;
+  dDeleteBtn.onclick = deleteDetail;
 
-  refresh().catch(err=> alert("초기 로딩 실패: " + (err?.message || err)));
+  addBack.addEventListener('click', (ev)=>{ if(ev.target === addBack) closeAdd(); });
+  detailBack.addEventListener('click', (ev)=>{ if(ev.target === detailBack) closeDetail(); });
+
+  prevBtn.onclick = ()=>{
+    if(mode==='month'){
+      current = new Date(current.getFullYear(), current.getMonth()-1, 1);
+    }else{
+      current = new Date(current.getFullYear(), current.getMonth(), current.getDate()-7);
+    }
+    refresh();
+  };
+  nextBtn.onclick = ()=>{
+    if(mode==='month'){
+      current = new Date(current.getFullYear(), current.getMonth()+1, 1);
+    }else{
+      current = new Date(current.getFullYear(), current.getMonth(), current.getDate()+7);
+    }
+    refresh();
+  };
+  monthBtn.onclick = ()=>{ mode='month'; refresh(); };
+  weekBtn.onclick = ()=>{ mode='week'; refresh(); };
+
+  bizFilter.onchange = render;
+  resetFilterBtn.onclick = ()=>{
+    bizFilter.value = '';
+    render();
+  };
+
+  // init
+  refresh();
 </script>
 </body>
-</html>
-"""
+</html>"""
 
-@app.route("/", methods=["GET"])
+
+@app.get("/")
 def index():
-    return Response(HTML_PAGE, mimetype="text/html")
+    return Response(_html(), mimetype="text/html")
+
+
+if __name__ == "__main__":
+    # local debug
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, debug=True)
