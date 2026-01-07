@@ -12,7 +12,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 def get_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL 환경변수가 설정되어 있지 않습니다.")
-    # Render Postgres는 보통 ssl 필요
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
@@ -95,7 +94,6 @@ def init_db():
                 cur.execute(f"ALTER TABLE events ADD COLUMN IF NOT EXISTS {col} {typ};")
 
             # 4) ✅ 타입 꼬임 해결: text -> date 안전 변환
-            #    (YYYY-MM-DD 형태만 date로 캐스팅, 나머지는 NULL 처리)
             def force_date(colname: str):
                 cur.execute(
                     f"""
@@ -115,7 +113,7 @@ def init_db():
             force_date('"start"')
             force_date('"end"')
 
-            # 5) 기존 데이터 보정(타입 정리 후 실행해야 안전)
+            # 5) 기존 데이터 보정
             cur.execute('UPDATE events SET event_date = COALESCE(event_date, "start") WHERE event_date IS NULL;')
             cur.execute('UPDATE events SET "start" = COALESCE("start", event_date) WHERE "start" IS NULL;')
             cur.execute('UPDATE events SET "end" = COALESCE("end", event_date) WHERE "end" IS NULL;')
@@ -123,7 +121,7 @@ def init_db():
             # business NULL 보정 후 NOT NULL
             cur.execute("UPDATE events SET business = COALESCE(business, '미분류') WHERE business IS NULL;")
 
-            # 6) NOT NULL 제약 (보정 후 적용)
+            # 6) NOT NULL 제약
             cur.execute('ALTER TABLE events ALTER COLUMN event_date SET NOT NULL;')
             cur.execute('ALTER TABLE events ALTER COLUMN "start" SET NOT NULL;')
             cur.execute('ALTER TABLE events ALTER COLUMN "end" SET NOT NULL;')
@@ -139,13 +137,11 @@ def init_db():
         conn.close()
 
 
-# ✅ API 에러를 항상 JSON으로 반환해서 "Unexpected token '<'" 없앰
 @app.errorhandler(Exception)
 def handle_any_error(e):
     path = request.path or ""
     if path.startswith("/api/"):
         return jsonify({"ok": False, "error": str(e)}), 500
-    # 웹 화면은 간단 HTML
     return Response(f"<h1>Internal Server Error</h1><pre>{str(e)}</pre>", mimetype="text/html", status=500)
 
 
@@ -233,9 +229,6 @@ def api_list_events():
 
 @app.post("/api/events")
 def api_add_events_range():
-    """
-    기간 등록 -> 날짜별 개별 row 생성
-    """
     data = request.get_json(force=True, silent=True) or {}
     start_s = clean_str(data.get("start"))
     end_s = clean_str(data.get("end"))
@@ -365,14 +358,14 @@ def _html():
       --danger:#dc2626;
       --shadow:0 6px 22px rgba(0,0,0,.06);
       --radius:16px;
+      --sun:#dc2626;
+      --sat:#2563eb;
     }
     *{box-sizing:border-box}
     body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Apple SD Gothic Neo,Noto Sans KR,Arial,sans-serif;background:var(--bg);color:var(--text)}
 
-    /* ✅ PC 좌우 여백 줄이고 달력 폭 넓힘 */
-    .wrap{max-width:2600px;margin:0 auto;padding:14px 10px}
+    .wrap{max-width:3200px;margin:0 auto;padding:14px 10px}
     @media (min-width: 1600px){ .wrap{padding:18px 14px} }
-    @media (min-width: 2000px){ .wrap{max-width:3200px} }
 
     .top{display:flex;flex-direction:column;gap:10px;align-items:center;justify-content:center;padding:12px 10px 6px}
     h1{margin:0;font-size:44px;letter-spacing:-1px}
@@ -394,18 +387,22 @@ def _html():
     table{width:100%;border-collapse:collapse;table-layout:fixed}
     th,td{border:1px solid var(--line);vertical-align:top;background:#fff}
     th{padding:10px 6px;font-size:15px;background:#fbfbfd}
-    .sun{color:#dc2626}
-    .sat{color:#2563eb}
+    .sun{color:var(--sun)}
+    .sat{color:var(--sat)}
 
-    /* ✅ 달력 칸 높이(PC 더 넉넉하게) */
     .cell{position:relative;height:170px;padding:8px}
     @media (max-width: 1200px){ .cell{height:150px} }
     @media (max-width: 820px){ .cell{height:122px} }
 
-    .date{font-weight:900;font-size:14px;position:absolute;top:8px;left:10px;color:#111827}
+    /* ✅ 날짜 숫자 색상 (일/토) */
+    .date{font-weight:1000;font-size:14px;position:absolute;top:8px;left:10px;color:#111827}
+    .date.sun{color:var(--sun)}
+    .date.sat{color:var(--sat)}
     .date.muted{color:#c0c4cc}
+    .date.muted.sun{color:rgba(220,38,38,.45)}
+    .date.muted.sat{color:rgba(37,99,235,.45)}
 
-    /* ✅ 월별 카드: 기본 2열 / 초대형 화면에서는 3열 */
+    /* ✅ 월별 카드: 무조건 2열만 */
     .events{
       margin-top:26px;
       display:grid;
@@ -413,14 +410,11 @@ def _html():
       gap:10px;
       align-content:start
     }
-    @media (min-width: 1900px){
-      .events{ grid-template-columns:repeat(3, minmax(0,1fr)); }
-    }
     @media (max-width: 820px){
       .events{ grid-template-columns:1fr; gap:8px; margin-top:22px; }
     }
 
-    /* ✅ 카드 폭/가독성 개선 */
+    /* ✅ 카드: 폭/가독성 + 줄바꿈 방지 */
     .event-card{
       border:1px solid var(--line);
       border-radius:14px;
@@ -433,10 +427,34 @@ def _html():
       min-height:76px
     }
     .event-card:hover{border-color:#c9d1ff}
-    .event-title{font-weight:1000;font-size:16px;line-height:1.2;margin-bottom:6px}
-    .kv{font-size:13px;line-height:1.3;color:#111827}
-    .kv .k{color:var(--muted);font-weight:900;margin-right:6px}
+
+    /* 사업명(타이틀)은 상대적으로 크게 유지하지만 한줄로(… 처리) */
+    .event-title{
+      font-weight:1000;
+      font-size:16px;
+      line-height:1.2;
+      margin-bottom:6px;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+
+    /* ✅ 사업명 제외 항목은 더 작게 + 한줄(… 처리) */
+    .kv{
+      font-size:12px;
+      line-height:1.25;
+      color:#111827;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+    .kv .k{
+      color:var(--muted);
+      font-weight:900;
+      margin-right:6px;
+    }
     .muted{color:var(--muted);font-weight:700}
+
     .biz-a{background:#fce7f3}
     .biz-b{background:#e0f2fe}
     .biz-c{background:#dcfce7}
@@ -447,10 +465,14 @@ def _html():
     .week-list{display:flex;flex-direction:column;gap:14px;}
     .week-day{border:1px solid var(--line);border-radius:16px;background:#fff;padding:12px;}
     .week-day-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:10px;}
+
+    /* ✅ 주별 날짜도 일/토 색상 적용 */
     .week-day-title{font-weight:1000;}
+    .week-day-title.sun{color:var(--sun)}
+    .week-day-title.sat{color:var(--sat)}
+
     .week-day-sub{color:var(--muted);font-size:12px;}
 
-    /* ✅ 주별 리스트: PC 한줄 3개 + 카드 더 넓게 보이게 */
     .week-cards{
       display:grid;
       grid-template-columns:repeat(3,minmax(0,1fr));
@@ -477,7 +499,7 @@ def _html():
       h1{font-size:34px}
       h2{font-size:22px}
       .event-title{font-size:14px}
-      .kv{font-size:12px}
+      .kv{font-size:11px}
       .grid2{grid-template-columns:1fr}
     }
   </style>
@@ -609,14 +631,19 @@ function getBusinessClass(name){
   const idx = h % 5;
   return ["biz-a","biz-b","biz-c","biz-d","biz-e"][idx];
 }
+
+/* ✅ 카드 항목 표기: '과정: xxx' 형태로 */
+function kvLine(label, value){
+  return `<div class="kv"><span class="k">${escapeHTML(label)}:</span>${escapeHTML(value)}</div>`;
+}
 function buildCardHTML(ev){
   const lines = [];
-  if(ev.course) lines.push(`<div class="kv"><span class="k">· 과정</span>${escapeHTML(ev.course)}</div>`);
-  if(ev.time) lines.push(`<div class="kv"><span class="k">· 시간</span>${escapeHTML(ev.time)}</div>`);
-  if(ev.people) lines.push(`<div class="kv"><span class="k">· 인원</span>${escapeHTML(ev.people)}</div>`);
-  if(ev.place) lines.push(`<div class="kv"><span class="k">· 장소</span>${escapeHTML(ev.place)}</div>`);
-  if(ev.admin) lines.push(`<div class="kv"><span class="k">· 행정</span>${escapeHTML(ev.admin)}</div>`);
-  if(ev.memo) lines.push(`<div class="kv"><span class="k">· 메모</span>${escapeHTML(ev.memo)}</div>`);
+  if(ev.course) lines.push(kvLine("과정", ev.course));
+  if(ev.time) lines.push(kvLine("시간", ev.time));
+  if(ev.people) lines.push(kvLine("인원", ev.people));
+  if(ev.place) lines.push(kvLine("장소", ev.place));
+  if(ev.admin) lines.push(kvLine("행정", ev.admin));
+  if(ev.memo) lines.push(kvLine("메모", ev.memo));
   return `<div class="event-title">${escapeHTML(ev.business||"")}</div>${lines.join("")}`;
 }
 
@@ -675,7 +702,15 @@ function renderMonth(){
 
       const inMonth = (d.getMonth() === mStart.getMonth());
       const dateDiv = document.createElement("div");
-      dateDiv.className = "date" + (inMonth ? "" : " muted");
+
+      // ✅ 날짜 색상: 일/토
+      const day = d.getDay(); // 0:일 6:토
+      let cls = "date";
+      if(!inMonth) cls += " muted";
+      if(day === 0) cls += " sun";
+      if(day === 6) cls += " sat";
+      dateDiv.className = cls;
+
       dateDiv.textContent = d.getDate();
       td.appendChild(dateDiv);
 
@@ -740,8 +775,13 @@ function renderWeek(){
 
     const head = document.createElement("div");
     head.className = "week-day-head";
+
+    // ✅ 주별 날짜도 일/토 색상
+    const day = d.getDay();
+    const titleCls = (day===0) ? "week-day-title sun" : (day===6) ? "week-day-title sat" : "week-day-title";
+
     head.innerHTML = `<div>
-        <div class="week-day-title">${iso} (${weekday[d.getDay()]})</div>
+        <div class="${titleCls}">${iso} (${weekday[day]})</div>
         <div class="week-day-sub">일정 ${dayEvents.length}건</div>
       </div>`;
 
