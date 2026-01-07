@@ -34,27 +34,30 @@ def clean_str(v):
 
 def init_db():
     """
-    ✅ 핵심
-    - 기존 DB(events)가 어떤 스키마든 망가져 있어도,
-      필요한 컬럼을 "추가/보정"해서 지금 코드 스키마로 맞춤.
-    - start/end 컬럼이 NOT NULL인 기존 테이블과 호환.
-    - "end"는 키워드 이슈가 있을 수 있어 항상 "end"로 쿼리.
+    ✅ 목표: 어떤 꼬인 DB 스키마/타입이 와도 현재 코드 기준으로 안전하게 맞춘다.
+    - events 테이블/컬럼 없으면 생성
+    - event_date / "start" / "end" 가 TEXT여도 DATE로 강제 변환 (YYYY-MM-DD만 통과)
+    - business NULL이 있으면 '미분류'로 채운 뒤 NOT NULL
+    - start/end NOT NULL 기존 테이블과 호환
     """
     conn = get_conn()
     conn.autocommit = True
     try:
         with conn.cursor() as cur:
             # 1) businesses
-            cur.execute("""
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS businesses (
                     id SERIAL PRIMARY KEY,
                     name TEXT UNIQUE NOT NULL,
                     created_at TIMESTAMP DEFAULT NOW()
                 );
-            """)
+                """
+            )
 
-            # 2) events (일단 없으면 생성)
-            cur.execute("""
+            # 2) events (없으면 생성)
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS events (
                     id SERIAL PRIMARY KEY,
                     event_date DATE,
@@ -70,48 +73,67 @@ def init_db():
                     color_key TEXT,
                     created_at TIMESTAMP DEFAULT NOW()
                 );
-            """)
+                """
+            )
 
-            # 3) 필요한 컬럼이 없으면 추가 (기존 테이블 꼬임 방지)
-            # Postgres: ADD COLUMN IF NOT EXISTS 지원
+            # 3) 필요한 컬럼이 없으면 추가
             alter_cols = [
-                ('event_date', 'DATE'),
-                ('"start"', 'DATE'),
-                ('"end"', 'DATE'),
-                ('business', 'TEXT'),
-                ('course', 'TEXT'),
-                ('time_range', 'TEXT'),
-                ('people', 'TEXT'),
-                ('place', 'TEXT'),
-                ('admin', 'TEXT'),
-                ('memo', 'TEXT'),
-                ('color_key', 'TEXT'),
-                ('created_at', 'TIMESTAMP DEFAULT NOW()'),
+                ("event_date", "DATE"),
+                ('"start"', "DATE"),
+                ('"end"', "DATE"),
+                ("business", "TEXT"),
+                ("course", "TEXT"),
+                ("time_range", "TEXT"),
+                ("people", "TEXT"),
+                ("place", "TEXT"),
+                ("admin", "TEXT"),
+                ("memo", "TEXT"),
+                ("color_key", "TEXT"),
+                ("created_at", "TIMESTAMP DEFAULT NOW()"),
             ]
             for col, typ in alter_cols:
-                cur.execute(f'ALTER TABLE events ADD COLUMN IF NOT EXISTS {col} {typ};')
+                cur.execute(f"ALTER TABLE events ADD COLUMN IF NOT EXISTS {col} {typ};")
 
-            # 4) 기존 데이터 보정
-            # event_date가 비어있으면 start로 채움
+            # 4) ✅ 타입 꼬임 해결: text -> date 안전 변환
+            #    (YYYY-MM-DD 형태만 date로 캐스팅, 나머지는 NULL 처리)
+            def force_date(colname: str):
+                cur.execute(
+                    f"""
+                    ALTER TABLE events
+                    ALTER COLUMN {colname} TYPE DATE
+                    USING (
+                        CASE
+                            WHEN {colname} IS NULL THEN NULL
+                            WHEN ({colname})::text ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$' THEN ({colname})::date
+                            ELSE NULL
+                        END
+                    );
+                    """
+                )
+
+            force_date("event_date")
+            force_date('"start"')
+            force_date('"end"')
+
+            # 5) 기존 데이터 보정(타입 정리 후 실행해야 안전)
             cur.execute('UPDATE events SET event_date = COALESCE(event_date, "start") WHERE event_date IS NULL;')
-            # start가 비어있으면 event_date로 채움
             cur.execute('UPDATE events SET "start" = COALESCE("start", event_date) WHERE "start" IS NULL;')
-            # end가 비어있으면 event_date로 채움
             cur.execute('UPDATE events SET "end" = COALESCE("end", event_date) WHERE "end" IS NULL;')
 
-            # 5) NOT NULL 제약이 필요한데, 기존 테이블에 이미 NOT NULL이 걸려있을 수 있음.
-            #   (이미 걸려 있으면 OK, 없으면 추가)
-            #   단, 데이터가 이미 NULL이면 실패하므로 위에서 먼저 채웠음.
+            # business NULL 보정 후 NOT NULL
+            cur.execute("UPDATE events SET business = COALESCE(business, '미분류') WHERE business IS NULL;")
+
+            # 6) NOT NULL 제약 (보정 후 적용)
             cur.execute('ALTER TABLE events ALTER COLUMN event_date SET NOT NULL;')
             cur.execute('ALTER TABLE events ALTER COLUMN "start" SET NOT NULL;')
             cur.execute('ALTER TABLE events ALTER COLUMN "end" SET NOT NULL;')
-            cur.execute('ALTER TABLE events ALTER COLUMN business SET NOT NULL;')
+            cur.execute("ALTER TABLE events ALTER COLUMN business SET NOT NULL;")
 
-            # 6) index
-            cur.execute('CREATE INDEX IF NOT EXISTS idx_events_date ON events(event_date);')
-            cur.execute('CREATE INDEX IF NOT EXISTS idx_events_business ON events(business);')
+            # 7) index
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_events_date ON events(event_date);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_events_business ON events(business);")
 
-            # 7) seed "전체"
+            # 8) seed "전체"
             cur.execute("INSERT INTO businesses(name) VALUES (%s) ON CONFLICT (name) DO NOTHING;", ("전체",))
     finally:
         conn.close()
@@ -131,7 +153,6 @@ init_db()
 
 
 def event_row_to_dict(r):
-    # event_date가 없으면 start로 fallback
     d = r.get("event_date") or r.get("start")
     if hasattr(d, "strftime"):
         d = d.strftime("%Y-%m-%d")
@@ -191,7 +212,7 @@ def api_list_events():
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            q = 'SELECT * FROM events WHERE 1=1'
+            q = "SELECT * FROM events WHERE 1=1"
             params = []
             if start:
                 q += " AND event_date >= %s"
@@ -214,7 +235,6 @@ def api_list_events():
 def api_add_events_range():
     """
     기간 등록 -> 날짜별 개별 row 생성
-    start/end는 date picker든 텍스트든 YYYY-MM-DD로 받음
     """
     data = request.get_json(force=True, silent=True) or {}
     start_s = clean_str(data.get("start"))
@@ -260,11 +280,13 @@ def api_add_events_range():
             d = start_d
             while d <= end_d:
                 if d not in excluded:
-                    # ✅ 기존 DB가 start/end NOT NULL이어도 문제 없게 같이 채움
-                    cur.execute("""
+                    cur.execute(
+                        """
                         INSERT INTO events(event_date, "start", "end", business, course, time_range, people, place, admin, memo, color_key)
                         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    """, (d, d, d, business, course, time_range, people, place, admin, memo, color_key))
+                        """,
+                        (d, d, d, business, course, time_range, people, place, admin, memo, color_key),
+                    )
                     inserted += 1
                 d += timedelta(days=1)
         return jsonify({"ok": True, "inserted": inserted})
@@ -293,7 +315,8 @@ def api_update_event(event_id: int):
     try:
         with conn.cursor() as cur:
             cur.execute("INSERT INTO businesses(name) VALUES (%s) ON CONFLICT (name) DO NOTHING;", (business,))
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE events
                 SET business = %s,
                     course = %s,
@@ -304,7 +327,9 @@ def api_update_event(event_id: int):
                     memo = %s,
                     color_key = %s
                 WHERE id = %s
-            """, (business, course, time_range, people, place, admin, memo, color_key, event_id))
+                """,
+                (business, course, time_range, people, place, admin, memo, color_key, event_id),
+            )
         return jsonify({"ok": True})
     finally:
         conn.close()
@@ -323,8 +348,6 @@ def api_delete_event(event_id: int):
 
 
 def _html():
-    # ✅ UI는 이전에 준 PC 폭 확장/주별 3열 유지 버전 그대로 가져오되,
-    #    "date input"을 쓰기 때문에 YYYY-MM-DD 경고 팝업(텍스트검증)도 자연히 줄어듦
     return r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -345,8 +368,11 @@ def _html():
     }
     *{box-sizing:border-box}
     body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Apple SD Gothic Neo,Noto Sans KR,Arial,sans-serif;background:var(--bg);color:var(--text)}
-    .wrap{max-width:2200px;margin:0 auto;padding:14px}
-    @media (min-width: 1800px){.wrap{max-width:2400px;}}
+
+    /* ✅ PC 좌우 여백 줄이고 달력 폭 넓힘 */
+    .wrap{max-width:2600px;margin:0 auto;padding:14px 10px}
+    @media (min-width: 1600px){ .wrap{padding:18px 14px} }
+    @media (min-width: 2000px){ .wrap{max-width:3200px} }
 
     .top{display:flex;flex-direction:column;gap:10px;align-items:center;justify-content:center;padding:12px 10px 6px}
     h1{margin:0;font-size:44px;letter-spacing:-1px}
@@ -364,23 +390,52 @@ def _html():
     .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:center}
 
     .panel{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+
     table{width:100%;border-collapse:collapse;table-layout:fixed}
     th,td{border:1px solid var(--line);vertical-align:top;background:#fff}
     th{padding:10px 6px;font-size:15px;background:#fbfbfd}
     .sun{color:#dc2626}
     .sat{color:#2563eb}
-    .cell{position:relative;height:140px;padding:6px}
-    .date{font-weight:900;font-size:14px;position:absolute;top:6px;left:8px;color:#111827}
+
+    /* ✅ 달력 칸 높이(PC 더 넉넉하게) */
+    .cell{position:relative;height:170px;padding:8px}
+    @media (max-width: 1200px){ .cell{height:150px} }
+    @media (max-width: 820px){ .cell{height:122px} }
+
+    .date{font-weight:900;font-size:14px;position:absolute;top:8px;left:10px;color:#111827}
     .date.muted{color:#c0c4cc}
-    .events{margin-top:22px;display:grid;grid-template-columns:repeat(2, minmax(0,1fr));gap:8px;align-content:start}
+
+    /* ✅ 월별 카드: 기본 2열 / 초대형 화면에서는 3열 */
+    .events{
+      margin-top:26px;
+      display:grid;
+      grid-template-columns:repeat(2, minmax(0,1fr));
+      gap:10px;
+      align-content:start
+    }
+    @media (min-width: 1900px){
+      .events{ grid-template-columns:repeat(3, minmax(0,1fr)); }
+    }
+    @media (max-width: 820px){
+      .events{ grid-template-columns:1fr; gap:8px; margin-top:22px; }
+    }
+
+    /* ✅ 카드 폭/가독성 개선 */
     .event-card{
-      border:1px solid var(--line);border-radius:14px;padding:10px;background:#fff;
-      box-shadow:0 2px 10px rgba(0,0,0,.04);cursor:pointer;user-select:none;overflow:hidden;min-height:64px
+      border:1px solid var(--line);
+      border-radius:14px;
+      padding:12px 12px;
+      background:#fff;
+      box-shadow:0 2px 10px rgba(0,0,0,.04);
+      cursor:pointer;
+      user-select:none;
+      overflow:hidden;
+      min-height:76px
     }
     .event-card:hover{border-color:#c9d1ff}
-    .event-title{font-weight:900;font-size:15px;line-height:1.2;margin-bottom:6px}
-    .kv{font-size:13px;line-height:1.25;color:#111827}
-    .kv .k{color:var(--muted);font-weight:800;margin-right:6px}
+    .event-title{font-weight:1000;font-size:16px;line-height:1.2;margin-bottom:6px}
+    .kv{font-size:13px;line-height:1.3;color:#111827}
+    .kv .k{color:var(--muted);font-weight:900;margin-right:6px}
     .muted{color:var(--muted);font-weight:700}
     .biz-a{background:#fce7f3}
     .biz-b{background:#e0f2fe}
@@ -392,14 +447,20 @@ def _html():
     .week-list{display:flex;flex-direction:column;gap:14px;}
     .week-day{border:1px solid var(--line);border-radius:16px;background:#fff;padding:12px;}
     .week-day-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:10px;}
-    .week-day-title{font-weight:900;}
+    .week-day-title{font-weight:1000;}
     .week-day-sub{color:var(--muted);font-size:12px;}
-    .week-cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;}
+
+    /* ✅ 주별 리스트: PC 한줄 3개 + 카드 더 넓게 보이게 */
+    .week-cards{
+      display:grid;
+      grid-template-columns:repeat(3,minmax(0,1fr));
+      gap:12px;
+    }
     @media (max-width: 1200px){.week-cards{grid-template-columns:repeat(2,minmax(0,1fr));}}
     @media (max-width: 700px){.week-cards{grid-template-columns:1fr;}}
 
     .backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;padding:14px;z-index:50}
-    .modal{width:min(760px, 100%);background:#fff;border-radius:18px;border:1px solid var(--line);box-shadow:0 18px 50px rgba(0,0,0,.25);overflow:hidden}
+    .modal{width:min(780px, 100%);background:#fff;border-radius:18px;border:1px solid var(--line);box-shadow:0 18px 50px rgba(0,0,0,.25);overflow:hidden}
     .modal-head{padding:14px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:10px}
     .modal-title{font-weight:1000}
     .modal-body{padding:14px 16px;display:flex;flex-direction:column;gap:10px}
@@ -415,8 +476,6 @@ def _html():
       .wrap{padding:10px}
       h1{font-size:34px}
       h2{font-size:22px}
-      .cell{height:122px}
-      .events{grid-template-columns:1fr}
       .event-title{font-size:14px}
       .kv{font-size:12px}
       .grid2{grid-template-columns:1fr}
@@ -561,14 +620,14 @@ function buildCardHTML(ev){
   return `<div class="event-title">${escapeHTML(ev.business||"")}</div>${lines.join("")}`;
 }
 
-// ✅ JSON 파싱 실패 방지: 응답이 JSON이 아니면 text로 읽어서 에러로 처리
+// ✅ JSON 파싱 실패 방지
 async function fetchJson(url, opts){
   const r = await fetch(url, opts);
   const text = await r.text();
   try{
     return JSON.parse(text);
   }catch(e){
-    throw new Error(`서버 응답 파싱 실패: ${text.slice(0,120)}...`);
+    throw new Error(`서버 응답 파싱 실패: ${text.slice(0,180)}...`);
   }
 }
 
